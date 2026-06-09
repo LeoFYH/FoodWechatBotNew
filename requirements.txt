@@ -4,3 +4,4 @@ openai
 python-dotenv
 wx-crypt==0.0.2
 httpx
+openpyxl

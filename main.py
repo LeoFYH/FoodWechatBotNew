@@ -1,17 +1,22 @@
 import json
 import logging
 import os
+import re
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 import httpx
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from wx_crypt import WXBizMsgCrypt, WxChannel_Wecom
@@ -26,6 +31,7 @@ DEFAULT_SYSTEM_PROMPT = "你是一个运行在微信里的 AI 助手，回答要
 DEFAULT_WECOM_BOT_NAME = "食品厂机器人"
 DEFAULT_WECOM_KF_SYNC_LIMIT = 100
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
+DEFAULT_EXPORT_DIR = "exports"
 
 
 def get_int_env(name: str, default: int) -> int:
@@ -46,6 +52,24 @@ def get_int_env(name: str, default: int) -> int:
     return parsed
 
 
+def get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_system_prompt() -> str:
+    prompt_file = os.getenv("PROMPT_FILE")
+    if prompt_file:
+        try:
+            return Path(prompt_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logging.warning("Failed to read PROMPT_FILE=%s: %s", prompt_file, exc)
+
+    return os.getenv("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
+
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -58,7 +82,9 @@ LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
 MODEL_NAME = os.getenv("MODEL_NAME") or DEFAULT_MODEL_NAME
 MAX_HISTORY_MESSAGES = get_int_env("MAX_HISTORY_MESSAGES", DEFAULT_MAX_HISTORY_MESSAGES)
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
+PROMPT_FILE = os.getenv("PROMPT_FILE")
+SYSTEM_PROMPT = load_system_prompt()
+PROMPT_TURN_CONTEXT = get_bool_env("PROMPT_TURN_CONTEXT", bool(PROMPT_FILE))
 MEMORY_FILE = Path(os.getenv("MEMORY_FILE", "memory.json"))
 MEMORY_LOCK = Lock()
 WECOM_CALLBACK_TOKEN = os.getenv("WECOM_CALLBACK_TOKEN") or os.getenv("WX_BOT_TOKEN")
@@ -72,6 +98,11 @@ WECOM_KF_ENCODING_AES_KEY = os.getenv("WECOM_KF_ENCODING_AES_KEY")
 WECOM_KF_CURSOR_FILE = Path(os.getenv("WECOM_KF_CURSOR_FILE", "kf_cursors.json"))
 WECOM_KF_SYNC_LIMIT = get_int_env("WECOM_KF_SYNC_LIMIT", DEFAULT_WECOM_KF_SYNC_LIMIT)
 HTTP_TIMEOUT_SECONDS = get_int_env("HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS)
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", DEFAULT_EXPORT_DIR))
+EXPORT_TOKEN = os.getenv("EXPORT_TOKEN")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "11VhtqvCxl_IVk9EJgzbAFcO2J50iiq_gy24ftZjLfBs")
+GOOGLE_SHEETS_WEBAPP_URL = os.getenv("GOOGLE_SHEETS_WEBAPP_URL")
+GOOGLE_SHEETS_WEBAPP_TOKEN = os.getenv("GOOGLE_SHEETS_WEBAPP_TOKEN")
 SEEN_WECOM_MSG_IDS: set[str] = set()
 SEEN_WECOM_MSG_IDS_LOCK = Lock()
 SEEN_WECOM_KF_MSG_IDS: set[str] = set()
@@ -154,12 +185,291 @@ def save_memory(memory: dict) -> None:
     )
 
 
+EXPORT_HEADERS = [
+    "会话ID",
+    "更新时间",
+    "公司",
+    "姓名",
+    "职位",
+    "负责内容",
+    "流程",
+    "频率",
+    "最费时间",
+    "出错后果",
+    "现用工具/费用",
+    "改善尝试",
+    "数据/规则",
+    "不在范围",
+    "原始对话",
+]
+
+
+RECAP_FIELD_PATTERNS = {
+    "company": [r"公司[：:]\s*(.+)", r"企业[：:]\s*(.+)"],
+    "name": [r"姓名[：:]\s*(.+)", r"联系人[：:]\s*(.+)"],
+    "title": [r"职位[：:]\s*(.+)", r"岗位[：:]\s*(.+)"],
+    "responsibility": [r"负责内容[：:]\s*(.+)", r"负责[：:]\s*(.+)"],
+    "flow": [r"流程[：:]\s*(.+)"],
+    "frequency": [r"频率[：:]\s*(.+)"],
+    "time_cost": [r"最费时间[：:]\s*(.+)", r"最花时间[：:]\s*(.+)"],
+    "error_impact": [r"出错后果[：:]\s*(.+)", r"错误后果[：:]\s*(.+)"],
+    "current_tools": [r"现在用[：:]\s*(.+)", r"现用工具/费用[：:]\s*(.+)"],
+    "improvement": [r"改善尝试[：:]\s*(.+)", r"之前试过[：:]\s*(.+)"],
+    "data_rules": [r"规则在[：:]\s*(.+)", r"数据/规则[：:]\s*(.+)"],
+    "out_of_scope": [r"不在范围[：:]\s*(.+)"],
+}
+
+
+def clean_export_value(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" ，,。.;；")
+
+
+def extract_first_match(text: str, patterns: list[str]) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.MULTILINE)
+        if match:
+            return clean_export_value(match.group(1))
+    return ""
+
+
+def extract_field_from_conversation(messages: list[dict[str, str]], patterns: list[str]) -> str:
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        value = extract_first_match(message.get("content", ""), patterns)
+        if value:
+            return value
+    return ""
+
+
+def latest_recap_text(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content", "")
+        if "流程" in content and ("频率" in content or "最费时间" in content):
+            return content
+    return ""
+
+
+def conversation_to_text(messages: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for message in messages:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        if not content:
+            continue
+        prefix = "用户" if role == "user" else "机器人" if role == "assistant" else role
+        lines.append(f"{prefix}: {content}")
+    return "\n".join(lines)
+
+
+def interview_record_from_history(session_id: str, messages: list[dict[str, str]]) -> dict[str, str]:
+    recap = latest_recap_text(messages)
+    text_for_extract = recap or conversation_to_text(messages)
+
+    record = {
+        "session_id": session_id,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "company": "",
+        "name": "",
+        "title": "",
+        "responsibility": "",
+        "flow": "",
+        "frequency": "",
+        "time_cost": "",
+        "error_impact": "",
+        "current_tools": "",
+        "improvement": "",
+        "data_rules": "",
+        "out_of_scope": "",
+        "transcript": conversation_to_text(messages),
+    }
+
+    for field, patterns in RECAP_FIELD_PATTERNS.items():
+        record[field] = extract_first_match(text_for_extract, patterns)
+
+    if not record["company"]:
+        record["company"] = extract_field_from_conversation(
+            messages,
+            [
+                r"公司(?:是|叫)?[：:，, ]\s*([^，,。；;\n]+)",
+                r"(?:我是|我在)([^，,。；;\n]{2,40}(?:公司|集团|店|厂|餐饮|科技|有限|有限公司))",
+            ],
+        )
+
+    if not record["company"]:
+        record["company"] = "未确认公司"
+
+    return record
+
+
+def safe_sheet_name(company: str, used_names: set[str]) -> str:
+    base = re.sub(r"[\[\]\*:/\\?]", "_", company).strip()
+    if not base:
+        base = "未确认公司"
+    base = base[:31]
+
+    name = base
+    suffix = 2
+    while name in used_names:
+        suffix_text = f"_{suffix}"
+        name = f"{base[:31 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+
+    used_names.add(name)
+    return name
+
+
+def write_sheet_rows(sheet, rows: list[list[str]]) -> None:
+    sheet.append(EXPORT_HEADERS)
+    for row in rows:
+        sheet.append(row)
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+    widths = [18, 18, 22, 12, 16, 24, 36, 18, 24, 28, 28, 28, 32, 28, 70]
+    for index, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+
+
+def collect_interview_records() -> list[dict[str, str]]:
+    with MEMORY_LOCK:
+        memory = load_memory()
+
+    records: list[dict[str, str]] = []
+    for session_id, messages in memory.items():
+        if not isinstance(messages, list):
+            continue
+        if not any(message.get("role") == "user" for message in messages if isinstance(message, dict)):
+            continue
+        records.append(interview_record_from_history(session_id, messages))
+
+    return records
+
+
+def record_to_export_row(record: dict[str, str]) -> list[str]:
+    return [
+        record["session_id"],
+        record["updated_at"],
+        record["company"],
+        record["name"],
+        record["title"],
+        record["responsibility"],
+        record["flow"],
+        record["frequency"],
+        record["time_cost"],
+        record["error_impact"],
+        record["current_tools"],
+        record["improvement"],
+        record["data_rules"],
+        record["out_of_scope"],
+        record["transcript"],
+    ]
+
+
+def build_interview_export() -> Path:
+    records = collect_interview_records()
+
+    workbook = Workbook()
+    summary_sheet = workbook.active
+    summary_sheet.title = "全部反馈"
+
+    rows_by_company: dict[str, list[list[str]]] = {}
+    all_rows: list[list[str]] = []
+
+    for record in records:
+        row = record_to_export_row(record)
+        all_rows.append(row)
+        rows_by_company.setdefault(record["company"], []).append(row)
+
+    write_sheet_rows(summary_sheet, all_rows)
+
+    used_sheet_names = {"全部反馈"}
+    for company in sorted(rows_by_company):
+        sheet = workbook.create_sheet(safe_sheet_name(company, used_sheet_names))
+        write_sheet_rows(sheet, rows_by_company[company])
+
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = EXPORT_DIR / f"interviews-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    workbook.save(output_path)
+    return output_path
+
+
+def push_interviews_to_google_sheets() -> dict[str, Any]:
+    if not GOOGLE_SHEETS_WEBAPP_URL:
+        raise HTTPException(status_code=500, detail="GOOGLE_SHEETS_WEBAPP_URL must be configured")
+
+    records = collect_interview_records()
+    payload = {
+        "token": GOOGLE_SHEETS_WEBAPP_TOKEN,
+        "spreadsheet_id": GOOGLE_SHEET_ID,
+        "headers": EXPORT_HEADERS,
+        "records": records,
+    }
+    response = httpx.post(
+        GOOGLE_SHEETS_WEBAPP_URL,
+        json=payload,
+        timeout=HTTP_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"Google Sheets webhook returned non-JSON: {response.text[:300]}") from exc
+
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail=f"Google Sheets webhook failed: {data}")
+
+    return {
+        "ok": True,
+        "spreadsheet_id": GOOGLE_SHEET_ID,
+        "record_count": len(records),
+        "company_count": len({record["company"] for record in records}),
+        "google_response": data,
+    }
+
+
 def trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
     return history[-MAX_HISTORY_MESSAGES:]
 
 
+def build_llm_messages(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    if PROMPT_TURN_CONTEXT:
+        user_turns = sum(1 for message in history if message.get("role") == "user")
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"运行时信息：当前会话已收到 {user_turns} 个用户回合。"
+                    "如果系统提示包含阶段流程，请用这个数字判断访谈节奏。"
+                    "如果回合数只是建议，不要把它当作硬性拒答或卡死条件。"
+                ),
+            }
+        )
+
+    return [*messages, *history]
+
+
 def call_llm(user_id: str, history: list[dict[str, str]]) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    messages = build_llm_messages(history)
 
     try:
         response = client.chat.completions.create(
@@ -739,6 +1049,27 @@ def get_memory_length(user_id: str) -> MemoryLengthResponse:
             raise HTTPException(status_code=500, detail=f"Invalid history for user_id: {user_id}")
 
     return MemoryLengthResponse(user_id=user_id, history_length=len(history))
+
+
+@app.get("/exports/interviews.xlsx")
+def export_interviews(request: Request):
+    if EXPORT_TOKEN and request.query_params.get("token") != EXPORT_TOKEN:
+        raise HTTPException(status_code=403, detail="invalid export token")
+
+    output_path = build_interview_export()
+    return FileResponse(
+        output_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=output_path.name,
+    )
+
+
+@app.post("/exports/google-sheets")
+def export_interviews_to_google_sheets(request: Request):
+    if EXPORT_TOKEN and request.query_params.get("token") != EXPORT_TOKEN:
+        raise HTTPException(status_code=403, detail="invalid export token")
+
+    return push_interviews_to_google_sheets()
 
 
 @app.delete("/memory/{user_id}", response_model=DeleteMemoryResponse)
