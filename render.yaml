@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: wechatclaw-ai-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com
+      - key: MODEL_NAME
+        value: deepseek-chat
+      - key: MAX_HISTORY_MESSAGES
+        value: "20"
+      - key: SYSTEM_PROMPT
+        value: 你是一个运行在微信里的 AI 助手，回答要简洁、有帮助。
