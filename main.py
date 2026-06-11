@@ -1,7 +1,13 @@
+import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import socket
+import struct
 import time
 import traceback
 import xml.etree.ElementTree as ET
@@ -12,7 +18,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from Crypto.Cipher import AES
 import httpx
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -32,6 +39,8 @@ DEFAULT_WECOM_BOT_NAME = "食品厂机器人"
 DEFAULT_WECOM_KF_SYNC_LIMIT = 100
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
 DEFAULT_EXPORT_DIR = "exports"
+DEFAULT_INTERVIEW_IDLE_ARCHIVE_SECONDS = 300
+DEFAULT_INTERVIEW_ARCHIVE_POLL_SECONDS = 60
 
 
 def get_int_env(name: str, default: int) -> int:
@@ -100,15 +109,22 @@ WECOM_KF_SYNC_LIMIT = get_int_env("WECOM_KF_SYNC_LIMIT", DEFAULT_WECOM_KF_SYNC_L
 HTTP_TIMEOUT_SECONDS = get_int_env("HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS)
 EXPORT_DIR = Path(os.getenv("EXPORT_DIR", DEFAULT_EXPORT_DIR))
 EXPORT_TOKEN = os.getenv("EXPORT_TOKEN")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "11VhtqvCxl_IVk9EJgzbAFcO2J50iiq_gy24ftZjLfBs")
-GOOGLE_SHEETS_WEBAPP_URL = os.getenv("GOOGLE_SHEETS_WEBAPP_URL")
-GOOGLE_SHEETS_WEBAPP_TOKEN = os.getenv("GOOGLE_SHEETS_WEBAPP_TOKEN")
+INTERVIEW_ARCHIVE_FILE = Path(os.getenv("INTERVIEW_ARCHIVE_FILE", "interviews.json"))
+INTERVIEW_IDLE_ARCHIVE_SECONDS = get_int_env(
+    "INTERVIEW_IDLE_ARCHIVE_SECONDS",
+    DEFAULT_INTERVIEW_IDLE_ARCHIVE_SECONDS,
+)
+INTERVIEW_ARCHIVE_POLL_SECONDS = get_int_env(
+    "INTERVIEW_ARCHIVE_POLL_SECONDS",
+    DEFAULT_INTERVIEW_ARCHIVE_POLL_SECONDS,
+)
 SEEN_WECOM_MSG_IDS: set[str] = set()
 SEEN_WECOM_MSG_IDS_LOCK = Lock()
 SEEN_WECOM_KF_MSG_IDS: set[str] = set()
 SEEN_WECOM_KF_MSG_IDS_LOCK = Lock()
 WECOM_KF_CURSOR_LOCK = Lock()
 WECOM_KF_ACCESS_TOKEN_LOCK = Lock()
+INTERVIEW_ARCHIVE_LOCK = Lock()
 WECOM_KF_ACCESS_TOKEN = ""
 WECOM_KF_ACCESS_TOKEN_EXPIRES_AT = 0.0
 
@@ -159,6 +175,14 @@ class WecomKfEvent(BaseModel):
     create_time: str
 
 
+class WecomKfApiError(RuntimeError):
+    def __init__(self, path: str, data: dict[str, Any]) -> None:
+        self.path = path
+        self.data = data
+        self.errcode = data.get("errcode")
+        super().__init__(f"WeCom API {path} failed: {data}")
+
+
 def load_memory() -> dict:
     if not MEMORY_FILE.exists():
         return {}
@@ -181,6 +205,46 @@ def load_memory() -> dict:
 def save_memory(memory: dict) -> None:
     MEMORY_FILE.write_text(
         json.dumps(memory, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def load_interview_archive() -> dict[str, dict[str, Any]]:
+    if not INTERVIEW_ARCHIVE_FILE.exists():
+        return {}
+
+    raw_archive = INTERVIEW_ARCHIVE_FILE.read_text(encoding="utf-8").strip()
+    if not raw_archive:
+        return {}
+
+    try:
+        data = json.loads(raw_archive)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="interviews.json is not valid JSON") from exc
+
+    if isinstance(data, list):
+        return {
+            str(record.get("session_id")): record
+            for record in data
+            if isinstance(record, dict) and record.get("session_id")
+        }
+    if isinstance(data, dict):
+        return {
+            str(session_id): record
+            for session_id, record in data.items()
+            if isinstance(record, dict)
+        }
+
+    raise HTTPException(status_code=500, detail="interviews.json must contain an object or array")
+
+
+def save_interview_archive(archive: dict[str, dict[str, Any]]) -> None:
+    INTERVIEW_ARCHIVE_FILE.write_text(
+        json.dumps(archive, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -218,6 +282,38 @@ RECAP_FIELD_PATTERNS = {
     "data_rules": [r"规则在[：:]\s*(.+)", r"数据/规则[：:]\s*(.+)"],
     "out_of_scope": [r"不在范围[：:]\s*(.+)"],
 }
+
+INTERVIEW_EXPORT_FIELDS = [
+    "company",
+    "name",
+    "title",
+    "responsibility",
+    "flow",
+    "frequency",
+    "time_cost",
+    "error_impact",
+    "current_tools",
+    "improvement",
+    "data_rules",
+    "out_of_scope",
+]
+
+INTERVIEW_FIELD_FALLBACKS = {
+    "company": "未确认公司",
+    "name": "未询问",
+    "title": "未确认职位",
+    "responsibility": "未明确说明，按对话暂归为其日常负责事项",
+    "flow": "未完整说明，按原始对话暂整理",
+    "frequency": "未提及，暂按按需/低频处理",
+    "time_cost": "未提及，暂按存在人工耗时处理",
+    "error_impact": "未提及明确错误，暂记为未出过错",
+    "current_tools": "未提及，暂记为现有人工/常用工具处理",
+    "improvement": "未提及，暂记为未尝试",
+    "data_rules": "未提及，暂按经验/内部文件处理",
+    "out_of_scope": "未提及，暂记为无特殊情况",
+}
+
+ARCHIVE_EVENT_TYPES = {"close_session", "session_close", "archive_session"}
 
 
 def clean_export_value(value: str) -> str:
@@ -266,6 +362,70 @@ def conversation_to_text(messages: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def extract_json_object(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("missing JSON object")
+
+    data = json.loads(text[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("JSON root must be an object")
+    return data
+
+
+def normalize_interview_record(record: dict[str, Any]) -> dict[str, str]:
+    normalized = {key: str(value or "").strip() for key, value in record.items()}
+
+    for field in INTERVIEW_EXPORT_FIELDS:
+        if not normalized.get(field):
+            normalized[field] = INTERVIEW_FIELD_FALLBACKS[field]
+
+    return normalized
+
+
+def llm_complete_interview_record(base_record: dict[str, str], transcript: str) -> dict[str, str]:
+    prompt = f"""
+请把下面的微信访谈对话整理成 Excel 表格字段，只输出一个 JSON 对象，不要输出解释。
+
+要求：
+- 字段必须包含：company, name, title, responsibility, flow, frequency, time_cost, error_impact, current_tools, improvement, data_rules, out_of_scope。
+- company 必须尽量使用用户原文里的公司名称；没明确说就填“未确认公司”。
+- title 必须尽量使用用户原文里的职位/岗位/工种；没明确说就按对话合理推断，仍不确定填“未确认职位”。
+- name 不再追问；如果对话没提到姓名或称呼，填“未询问”。
+- 其他字段不要留空；信息不全时，根据对话做保守推断，并用简短中文写清楚“暂推”。
+- 不要编造具体金额、具体系统名或具体时间；没有提到就写“未提及，暂推...”。
+
+现有初步抽取：
+{json.dumps({field: base_record.get(field, "") for field in INTERVIEW_EXPORT_FIELDS}, ensure_ascii=False)}
+
+原始对话：
+{transcript}
+""".strip()
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "你是访谈记录结构化助手，只输出可解析 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    raw = response.choices[0].message.content or ""
+    data = extract_json_object(raw)
+
+    completed = dict(base_record)
+    for field in INTERVIEW_EXPORT_FIELDS:
+        value = data.get(field)
+        if value:
+            completed[field] = clean_export_value(str(value))
+    return normalize_interview_record(completed)
+
+
 def interview_record_from_history(session_id: str, messages: list[dict[str, str]]) -> dict[str, str]:
     recap = latest_recap_text(messages)
     text_for_extract = recap or conversation_to_text(messages)
@@ -303,7 +463,177 @@ def interview_record_from_history(session_id: str, messages: list[dict[str, str]
     if not record["company"]:
         record["company"] = "未确认公司"
 
+    return normalize_interview_record(record)
+
+
+def last_user_message_ts(messages: list[dict[str, Any]]) -> float | None:
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+
+        ts = message.get("ts")
+        if isinstance(ts, (int, float)):
+            return float(ts)
+        if isinstance(ts, str):
+            try:
+                return float(ts)
+            except ValueError:
+                pass
+
+        created_at = message.get("created_at")
+        if isinstance(created_at, str):
+            try:
+                return datetime.fromisoformat(created_at).timestamp()
+            except ValueError:
+                return None
+
+    return None
+
+
+def completed_interview_record_from_history(
+    session_id: str,
+    messages: list[dict[str, str]],
+    reason: str,
+) -> dict[str, str]:
+    record = interview_record_from_history(session_id, messages)
+    transcript = record["transcript"]
+
+    try:
+        record = llm_complete_interview_record(record, transcript)
+    except Exception as exc:
+        logger.warning(
+            "interview_archive_llm_failed session_id=%s reason=%s error=%s",
+            session_id,
+            reason,
+            exc,
+        )
+
+    record["session_id"] = session_id
+    record["updated_at"] = now_iso()
+    record["archived_at"] = now_iso()
+    record["archive_reason"] = reason
+    record["status"] = "archived"
+    record["transcript"] = transcript
+    record["_message_count"] = str(len(messages))
+    record["_last_user_ts"] = str(last_user_message_ts(messages) or "")
+    return normalize_interview_record(record)
+
+
+def archive_interview_session(session_id: str, reason: str) -> dict[str, str] | None:
+    with MEMORY_LOCK:
+        memory = load_memory()
+        messages = memory.get(session_id, [])
+
+    if not isinstance(messages, list):
+        logger.warning("interview_archive_invalid_history session_id=%s", session_id)
+        return None
+    if not any(isinstance(message, dict) and message.get("role") == "user" for message in messages):
+        logger.info("interview_archive_skipped_no_user_messages session_id=%s reason=%s", session_id, reason)
+        return None
+
+    message_count = len(messages)
+    last_user_ts = str(last_user_message_ts(messages) or "")
+    with INTERVIEW_ARCHIVE_LOCK:
+        archive = load_interview_archive()
+        existing = archive.get(session_id)
+        if (
+            existing
+            and str(existing.get("_message_count", "")) == str(message_count)
+            and str(existing.get("_last_user_ts", "")) == last_user_ts
+        ):
+            return normalize_interview_record(existing)
+
+    record = completed_interview_record_from_history(session_id, messages, reason)
+    with INTERVIEW_ARCHIVE_LOCK:
+        archive = load_interview_archive()
+        archive[session_id] = record
+        save_interview_archive(archive)
+
+    logger.info(
+        "interview_archived session_id=%s reason=%s message_count=%s company=%s title=%s",
+        session_id,
+        reason,
+        message_count,
+        record.get("company"),
+        record.get("title"),
+    )
     return record
+
+
+def archive_idle_interviews_once() -> None:
+    now = time.time()
+    candidates: list[tuple[str, str]] = []
+
+    with MEMORY_LOCK:
+        memory = load_memory()
+        for session_id, messages in memory.items():
+            if not isinstance(messages, list):
+                continue
+            if not any(isinstance(message, dict) and message.get("role") == "user" for message in messages):
+                continue
+
+            last_ts = last_user_message_ts(messages)
+            if not last_ts:
+                continue
+            if now - last_ts >= INTERVIEW_IDLE_ARCHIVE_SECONDS:
+                candidates.append((str(session_id), str(last_ts)))
+
+    with INTERVIEW_ARCHIVE_LOCK:
+        archive = load_interview_archive()
+        filtered_candidates: list[str] = []
+        for session_id, last_ts in candidates:
+            existing = archive.get(session_id)
+            if existing and str(existing.get("_last_user_ts", "")) == last_ts:
+                continue
+            filtered_candidates.append(session_id)
+
+    for session_id in filtered_candidates:
+        try:
+            archive_interview_session(session_id, "idle_timeout")
+        except Exception as exc:
+            logger.exception("interview_idle_archive_failed session_id=%s error=%s", session_id, exc)
+
+
+def archive_export_backfill_interviews_once() -> None:
+    now = time.time()
+    candidates: list[str] = []
+
+    with MEMORY_LOCK:
+        memory = load_memory()
+        with INTERVIEW_ARCHIVE_LOCK:
+            archive = load_interview_archive()
+
+        for session_id, messages in memory.items():
+            if session_id in archive:
+                continue
+            if not isinstance(messages, list):
+                continue
+            if not any(isinstance(message, dict) and message.get("role") == "user" for message in messages):
+                continue
+
+            last_ts = last_user_message_ts(messages)
+            if not last_ts or now - last_ts >= INTERVIEW_IDLE_ARCHIVE_SECONDS:
+                candidates.append(str(session_id))
+
+    for session_id in candidates:
+        try:
+            archive_interview_session(session_id, "export_backfill")
+        except Exception as exc:
+            logger.exception("interview_export_backfill_failed session_id=%s error=%s", session_id, exc)
+
+
+async def interview_archive_sweeper() -> None:
+    while True:
+        await asyncio.sleep(INTERVIEW_ARCHIVE_POLL_SECONDS)
+        try:
+            await asyncio.to_thread(archive_idle_interviews_once)
+        except Exception as exc:
+            logger.exception("interview_archive_sweeper_failed error=%s", exc)
+
+
+@app.on_event("startup")
+async def start_interview_archive_sweeper() -> None:
+    asyncio.create_task(interview_archive_sweeper())
 
 
 def safe_sheet_name(company: str, used_names: set[str]) -> str:
@@ -348,11 +678,25 @@ def write_sheet_rows(sheet, rows: list[list[str]]) -> None:
 
 
 def collect_interview_records() -> list[dict[str, str]]:
+    archive_export_backfill_interviews_once()
+
+    with INTERVIEW_ARCHIVE_LOCK:
+        archive = load_interview_archive()
+
     with MEMORY_LOCK:
         memory = load_memory()
 
     records: list[dict[str, str]] = []
+    archived_session_ids = set()
+    for session_id, record in archive.items():
+        normalized = normalize_interview_record(record)
+        normalized["session_id"] = session_id
+        records.append(normalized)
+        archived_session_ids.add(session_id)
+
     for session_id, messages in memory.items():
+        if session_id in archived_session_ids:
+            continue
         if not isinstance(messages, list):
             continue
         if not any(message.get("role") == "user" for message in messages if isinstance(message, dict)):
@@ -408,41 +752,6 @@ def build_interview_export() -> Path:
     output_path = EXPORT_DIR / f"interviews-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
     workbook.save(output_path)
     return output_path
-
-
-def push_interviews_to_google_sheets() -> dict[str, Any]:
-    if not GOOGLE_SHEETS_WEBAPP_URL:
-        raise HTTPException(status_code=500, detail="GOOGLE_SHEETS_WEBAPP_URL must be configured")
-
-    records = collect_interview_records()
-    payload = {
-        "token": GOOGLE_SHEETS_WEBAPP_TOKEN,
-        "spreadsheet_id": GOOGLE_SHEET_ID,
-        "headers": EXPORT_HEADERS,
-        "records": records,
-    }
-    response = httpx.post(
-        GOOGLE_SHEETS_WEBAPP_URL,
-        json=payload,
-        timeout=HTTP_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=f"Google Sheets webhook returned non-JSON: {response.text[:300]}") from exc
-
-    if not data.get("ok"):
-        raise HTTPException(status_code=502, detail=f"Google Sheets webhook failed: {data}")
-
-    return {
-        "ok": True,
-        "spreadsheet_id": GOOGLE_SHEET_ID,
-        "record_count": len(records),
-        "company_count": len({record["company"] for record in records}),
-        "google_response": data,
-    }
 
 
 def trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -522,14 +831,29 @@ def handle_user_message(user_id: str, message: str) -> ChatResponse:
         if not isinstance(history, list):
             raise HTTPException(status_code=500, detail=f"Invalid history for user_id: {user_id}")
 
-        history.append({"role": "user", "content": message})
+        user_message_ts = time.time()
+        history.append(
+            {
+                "role": "user",
+                "content": message,
+                "created_at": now_iso(),
+                "ts": user_message_ts,
+            }
+        )
         history = trim_history(history)
         memory[user_id] = history
 
         logger.info("chat_request user_id=%s history_length=%s", user_id, len(history))
 
         answer = call_llm(user_id, history)
-        history.append({"role": "assistant", "content": answer})
+        history.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "created_at": now_iso(),
+                "ts": time.time(),
+            }
+        )
         history = trim_history(history)
         memory[user_id] = history
         save_memory(memory)
@@ -691,6 +1015,98 @@ def get_wecom_kf_crypto() -> WXBizMsgCrypt:
     )
 
 
+def compute_wecom_signature(token: str, timestamp: str, nonce: str, encrypted: str) -> str:
+    raw = "".join(sorted([token, timestamp, nonce, encrypted]))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def decrypt_wecom_kf_payload(encrypted: str) -> tuple[bytes, str]:
+    if not WECOM_KF_ENCODING_AES_KEY:
+        raise HTTPException(status_code=500, detail="WECOM_KF_ENCODING_AES_KEY must be configured")
+
+    try:
+        key = base64.b64decode(WECOM_KF_ENCODING_AES_KEY + "=")
+        if len(key) != 32:
+            raise ValueError("invalid key length")
+        cryptor = AES.new(key, AES.MODE_CBC, key[:16])
+        plain_text = cryptor.decrypt(base64.b64decode(encrypted))
+        pad = plain_text[-1]
+        if pad < 1 or pad > 32:
+            raise ValueError("invalid padding")
+
+        content = plain_text[16:-pad]
+        if len(content) < 4:
+            raise ValueError("missing message length")
+        xml_len = socket.ntohl(struct.unpack("I", content[:4])[0])
+        xml_content = content[4 : xml_len + 4]
+        receive_id = content[xml_len + 4 :].decode("utf-8", errors="replace")
+        return xml_content, receive_id
+    except Exception as exc:
+        logger.warning("wecom_kf_decrypt_payload_failed error=%s", exc)
+        raise HTTPException(status_code=403, detail="WeCom KF decrypt failed") from exc
+
+
+def verify_wecom_kf_signature(msg_signature: str, timestamp: str, nonce: str, encrypted: str) -> None:
+    if not WECOM_KF_CALLBACK_TOKEN:
+        raise HTTPException(status_code=500, detail="WECOM_KF_CALLBACK_TOKEN must be configured")
+
+    expected_signature = compute_wecom_signature(
+        WECOM_KF_CALLBACK_TOKEN,
+        timestamp,
+        nonce,
+        encrypted,
+    )
+    if not hmac.compare_digest(expected_signature, msg_signature):
+        logger.warning(
+            "wecom_kf_signature_failed expected=%s actual=%s",
+            expected_signature,
+            msg_signature,
+        )
+        raise HTTPException(status_code=403, detail="WeCom KF signature failed")
+
+
+def decrypt_wecom_kf_verify_url(
+    msg_signature: str,
+    timestamp: str,
+    nonce: str,
+    echostr: str,
+) -> str:
+    verify_wecom_kf_signature(msg_signature, timestamp, nonce, echostr)
+    decrypted_echo, receive_id = decrypt_wecom_kf_payload(echostr)
+    if WECOM_KF_CORP_ID and receive_id != WECOM_KF_CORP_ID:
+        logger.warning(
+            "wecom_kf_receive_id_mismatch expected=%s actual=%s",
+            WECOM_KF_CORP_ID,
+            receive_id,
+        )
+    return decrypted_echo.decode("utf-8")
+
+
+def decrypt_wecom_kf_message(
+    encrypted_body: bytes,
+    msg_signature: str,
+    timestamp: str,
+    nonce: str,
+) -> bytes:
+    try:
+        encrypted = xml_text(ET.fromstring(encrypted_body), "Encrypt")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid WeCom KF encrypted XML") from exc
+
+    if not encrypted:
+        raise HTTPException(status_code=400, detail="Missing WeCom KF Encrypt field")
+
+    verify_wecom_kf_signature(msg_signature, timestamp, nonce, encrypted)
+    plain_xml, receive_id = decrypt_wecom_kf_payload(encrypted)
+    if WECOM_KF_CORP_ID and receive_id != WECOM_KF_CORP_ID:
+        logger.warning(
+            "wecom_kf_receive_id_mismatch expected=%s actual=%s",
+            WECOM_KF_CORP_ID,
+            receive_id,
+        )
+    return plain_xml
+
+
 def parse_wecom_kf_event(plain_xml: bytes | str) -> WecomKfEvent:
     if isinstance(plain_xml, bytes):
         plain_xml = plain_xml.decode("utf-8")
@@ -810,24 +1226,125 @@ def post_wecom_kf_api(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     response.raise_for_status()
     data = response.json()
     if data.get("errcode") != 0:
-        raise RuntimeError(f"WeCom API {path} failed: {data}")
+        raise WecomKfApiError(path, data)
     return data
+
+
+def get_wecom_kf_service_state(open_kfid: str, external_userid: str) -> int | None:
+    data = post_wecom_kf_api(
+        "kf/service_state/get",
+        {
+            "open_kfid": open_kfid,
+            "external_userid": external_userid,
+        },
+    )
+    service_state = data.get("service_state")
+    try:
+        state = int(service_state)
+    except (TypeError, ValueError):
+        logger.warning(
+            "wecom_kf_service_state_invalid open_kfid=%s external_userid=%s data=%s",
+            open_kfid,
+            external_userid,
+            data,
+        )
+        return None
+
+    logger.info(
+        "wecom_kf_service_state open_kfid=%s external_userid=%s state=%s servicer=%s",
+        open_kfid,
+        external_userid,
+        state,
+        data.get("servicer_userid"),
+    )
+    return state
+
+
+def transfer_wecom_kf_to_ai(open_kfid: str, external_userid: str) -> None:
+    data = post_wecom_kf_api(
+        "kf/service_state/trans",
+        {
+            "open_kfid": open_kfid,
+            "external_userid": external_userid,
+            "service_state": 1,
+        },
+    )
+    logger.info(
+        "wecom_kf_service_state_trans_to_ai open_kfid=%s external_userid=%s msg_code=%s",
+        open_kfid,
+        external_userid,
+        data.get("msg_code"),
+    )
+
+
+def ensure_wecom_kf_ai_session(open_kfid: str, external_userid: str) -> None:
+    state = get_wecom_kf_service_state(open_kfid, external_userid)
+    if state in (0, 1, None):
+        return
+
+    try:
+        transfer_wecom_kf_to_ai(open_kfid, external_userid)
+    except WecomKfApiError as exc:
+        logger.warning(
+            "wecom_kf_service_state_trans_to_ai_failed open_kfid=%s external_userid=%s state=%s errcode=%s data=%s",
+            open_kfid,
+            external_userid,
+            state,
+            exc.errcode,
+            exc.data,
+        )
+        raise
 
 
 def send_wecom_kf_text(open_kfid: str, external_userid: str, content: str) -> None:
     if not open_kfid or not external_userid:
         raise RuntimeError("open_kfid and external_userid are required to send WeCom KF message")
 
-    post_wecom_kf_api(
-        "kf/send_msg",
-        {
-            "touser": external_userid,
-            "open_kfid": open_kfid,
-            "msgtype": "text",
-            "text": {"content": content},
-        },
-    )
+    payload = {
+        "touser": external_userid,
+        "open_kfid": open_kfid,
+        "msgtype": "text",
+        "text": {"content": content},
+    }
+    ensure_wecom_kf_ai_session(open_kfid, external_userid)
+
+    try:
+        post_wecom_kf_api("kf/send_msg", payload)
+    except WecomKfApiError as exc:
+        if exc.errcode != 95018:
+            raise
+
+        logger.warning(
+            "wecom_kf_send_state_invalid_retry open_kfid=%s external_userid=%s data=%s",
+            open_kfid,
+            external_userid,
+            exc.data,
+        )
+        transfer_wecom_kf_to_ai(open_kfid, external_userid)
+        post_wecom_kf_api("kf/send_msg", payload)
+
     logger.info("wecom_kf_send_success open_kfid=%s external_userid=%s", open_kfid, external_userid)
+
+
+def maybe_archive_wecom_kf_event(event_info: dict[str, Any]) -> None:
+    event_type = str(event_info.get("event_type") or "")
+    open_kfid = str(event_info.get("open_kfid") or "")
+    external_userid = str(event_info.get("external_userid") or "")
+    if not open_kfid or not external_userid:
+        return
+
+    should_archive = event_type in ARCHIVE_EVENT_TYPES
+    if event_type == "session_status_change":
+        try:
+            should_archive = int(event_info.get("change_type", 0)) == 3
+        except (TypeError, ValueError):
+            should_archive = False
+
+    if not should_archive:
+        return
+
+    session_id = f"kf:{open_kfid}:{external_userid}"
+    archive_interview_session(session_id, f"kf_event:{event_type}")
 
 
 def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
@@ -850,7 +1367,10 @@ def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
     )
 
     if msg_type == "event":
-        logger.info("wecom_kf_event msg_id=%s event=%s", msg_id, item.get("event", {}))
+        event_info = item.get("event", {})
+        logger.info("wecom_kf_event msg_id=%s event=%s", msg_id, event_info)
+        if isinstance(event_info, dict):
+            maybe_archive_wecom_kf_event(event_info)
         return
 
     if msg_type != "text":
@@ -981,18 +1501,12 @@ async def wecom_kf_verify(request: Request):
     nonce = require_query_param(request, "nonce")
     echostr = require_query_param(request, "echostr")
 
-    ret, decrypted_echo = get_wecom_kf_crypto().VerifyURL(
+    decrypted_echo = decrypt_wecom_kf_verify_url(
         msg_signature,
         timestamp,
         nonce,
         echostr,
     )
-    if ret != 0:
-        logger.warning("wecom_kf_verify_failed ret=%s", ret)
-        raise HTTPException(status_code=403, detail=f"WeCom KF verify failed: {ret}")
-
-    if isinstance(decrypted_echo, bytes):
-        decrypted_echo = decrypted_echo.decode("utf-8")
 
     return PlainTextResponse(decrypted_echo)
 
@@ -1004,15 +1518,12 @@ async def wecom_kf_callback(request: Request, background_tasks: BackgroundTasks)
     nonce = require_query_param(request, "nonce")
     encrypted_body = await request.body()
 
-    ret, plain_xml = get_wecom_kf_crypto().DecryptMsg(
+    plain_xml = decrypt_wecom_kf_message(
         encrypted_body,
         msg_signature,
         timestamp,
         nonce,
     )
-    if ret != 0:
-        logger.warning("wecom_kf_decrypt_failed ret=%s", ret)
-        raise HTTPException(status_code=403, detail=f"WeCom KF decrypt failed: {ret}")
 
     try:
         event = parse_wecom_kf_event(plain_xml)
@@ -1051,10 +1562,103 @@ def get_memory_length(user_id: str) -> MemoryLengthResponse:
     return MemoryLengthResponse(user_id=user_id, history_length=len(history))
 
 
+def require_export_token(request: Request) -> str:
+    token = request.query_params.get("token", "")
+    if EXPORT_TOKEN and token != EXPORT_TOKEN:
+        raise HTTPException(status_code=403, detail="invalid export token")
+    return token
+
+
+@app.get("/exports", response_class=HTMLResponse)
+def export_page(request: Request):
+    token = request.query_params.get("token", "")
+
+    if EXPORT_TOKEN and token != EXPORT_TOKEN:
+        return HTMLResponse(
+            """
+            <!doctype html>
+            <html lang="zh-CN">
+              <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>访谈导出</title>
+                <style>
+                  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 48px; color: #172033; }
+                  main { max-width: 520px; }
+                  label { display: block; margin: 18px 0 8px; font-weight: 600; }
+                  input { width: 100%; box-sizing: border-box; padding: 12px 14px; border: 1px solid #ccd3df; border-radius: 8px; font-size: 16px; }
+                  button { margin-top: 18px; padding: 12px 18px; border: 0; border-radius: 8px; background: #1f6feb; color: white; font-size: 16px; cursor: pointer; }
+                  p { color: #667085; line-height: 1.6; }
+                </style>
+              </head>
+              <body>
+                <main>
+                  <h1>访谈导出</h1>
+                  <p>请输入导出口令后进入导出页。</p>
+                  <form method="get" action="/exports">
+                    <label for="token">导出口令</label>
+                    <input id="token" name="token" type="password" autocomplete="current-password">
+                    <button type="submit">进入</button>
+                  </form>
+                </main>
+              </body>
+            </html>
+            """
+        )
+
+    records = collect_interview_records()
+    companies = sorted({record["company"] for record in records})
+    download_url = "/exports/interviews.xlsx"
+    if token:
+        download_url = f"{download_url}?token={token}"
+
+    company_items = "".join(f"<li>{company}</li>" for company in companies[:30])
+    if len(companies) > 30:
+        company_items += f"<li>还有 {len(companies) - 30} 个公司...</li>"
+    if not company_items:
+        company_items = "<li>暂无公司数据</li>"
+
+    return HTMLResponse(
+        f"""
+        <!doctype html>
+        <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>访谈导出</title>
+            <style>
+              body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 48px; color: #172033; background: #f6f8fb; }}
+              main {{ max-width: 880px; }}
+              .panel {{ background: white; border: 1px solid #e3e8f0; border-radius: 10px; padding: 28px; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06); }}
+              .stats {{ display: flex; gap: 16px; margin: 22px 0; }}
+              .stat {{ background: #f1f5fb; border-radius: 8px; padding: 16px 18px; min-width: 140px; }}
+              .stat strong {{ display: block; font-size: 28px; color: #0f4c81; }}
+              a.button {{ display: inline-block; margin-top: 10px; padding: 13px 18px; border-radius: 8px; background: #1f6feb; color: white; text-decoration: none; font-weight: 700; }}
+              p {{ color: #667085; line-height: 1.6; }}
+              ul {{ columns: 2; color: #344054; line-height: 1.8; }}
+            </style>
+          </head>
+          <body>
+            <main class="panel">
+              <h1>访谈导出</h1>
+              <p>点击按钮生成并下载 Excel。文件包含“全部反馈”和每个公司的独立 sheet。</p>
+              <div class="stats">
+                <div class="stat"><strong>{len(records)}</strong>访谈记录</div>
+                <div class="stat"><strong>{len(companies)}</strong>公司分表</div>
+              </div>
+              <a class="button" href="{download_url}">下载 Excel</a>
+              <h2>当前公司</h2>
+              <ul>{company_items}</ul>
+            </main>
+          </body>
+        </html>
+        """
+    )
+
+
 @app.get("/exports/interviews.xlsx")
 def export_interviews(request: Request):
-    if EXPORT_TOKEN and request.query_params.get("token") != EXPORT_TOKEN:
-        raise HTTPException(status_code=403, detail="invalid export token")
+    require_export_token(request)
 
     output_path = build_interview_export()
     return FileResponse(
@@ -1062,14 +1666,6 @@ def export_interviews(request: Request):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=output_path.name,
     )
-
-
-@app.post("/exports/google-sheets")
-def export_interviews_to_google_sheets(request: Request):
-    if EXPORT_TOKEN and request.query_params.get("token") != EXPORT_TOKEN:
-        raise HTTPException(status_code=403, detail="invalid export token")
-
-    return push_interviews_to_google_sheets()
 
 
 @app.delete("/memory/{user_id}", response_model=DeleteMemoryResponse)

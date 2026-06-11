@@ -1,5 +1,6 @@
 ﻿.env
 memory.json
+interviews.json
 kf_cursors.json
 __pycache__/
 *.pyc
