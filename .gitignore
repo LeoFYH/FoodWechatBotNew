@@ -1,6 +1,8 @@
 ﻿.env
 memory.json
 interviews.json
+session_state.json
+orders.json
 kf_cursors.json
 __pycache__/
 *.pyc

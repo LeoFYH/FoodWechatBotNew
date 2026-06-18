@@ -41,6 +41,8 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 20
 DEFAULT_EXPORT_DIR = "exports"
 DEFAULT_INTERVIEW_IDLE_ARCHIVE_SECONDS = 300
 DEFAULT_INTERVIEW_ARCHIVE_POLL_SECONDS = 60
+DEFAULT_SESSION_STATE_FILE = "session_state.json"
+DEFAULT_ORDER_FILE = "orders.json"
 
 
 def get_int_env(name: str, default: int) -> int:
@@ -95,6 +97,9 @@ PROMPT_FILE = os.getenv("PROMPT_FILE")
 SYSTEM_PROMPT = load_system_prompt()
 PROMPT_TURN_CONTEXT = get_bool_env("PROMPT_TURN_CONTEXT", bool(PROMPT_FILE))
 MEMORY_FILE = Path(os.getenv("MEMORY_FILE", "memory.json"))
+SESSION_STATE_FILE = Path(os.getenv("SESSION_STATE_FILE", DEFAULT_SESSION_STATE_FILE))
+ORDER_FILE = Path(os.getenv("ORDER_FILE", DEFAULT_ORDER_FILE))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 MEMORY_LOCK = Lock()
 WECOM_CALLBACK_TOKEN = os.getenv("WECOM_CALLBACK_TOKEN") or os.getenv("WX_BOT_TOKEN")
 WECOM_ENCODING_AES_KEY = os.getenv("WECOM_ENCODING_AES_KEY") or os.getenv("WX_BOT_AES_KEY")
@@ -125,6 +130,8 @@ SEEN_WECOM_KF_MSG_IDS_LOCK = Lock()
 WECOM_KF_CURSOR_LOCK = Lock()
 WECOM_KF_ACCESS_TOKEN_LOCK = Lock()
 INTERVIEW_ARCHIVE_LOCK = Lock()
+SESSION_STATE_LOCK = Lock()
+ORDER_LOCK = Lock()
 WECOM_KF_ACCESS_TOKEN = ""
 WECOM_KF_ACCESS_TOKEN_EXPIRES_AT = 0.0
 
@@ -211,6 +218,62 @@ def save_memory(memory: dict) -> None:
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def load_session_state() -> dict[str, dict[str, Any]]:
+    if not SESSION_STATE_FILE.exists():
+        return {}
+
+    raw_state = SESSION_STATE_FILE.read_text(encoding="utf-8").strip()
+    if not raw_state:
+        return {}
+
+    try:
+        data = json.loads(raw_state)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="session_state.json is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="session_state.json must contain a JSON object")
+
+    state: dict[str, dict[str, Any]] = {}
+    for user_id, record in data.items():
+        if isinstance(record, dict):
+            state[str(user_id)] = record
+    return state
+
+
+def save_session_state(state: dict[str, dict[str, Any]]) -> None:
+    SESSION_STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_orders() -> list[dict[str, Any]]:
+    if not ORDER_FILE.exists():
+        return []
+
+    raw_orders = ORDER_FILE.read_text(encoding="utf-8").strip()
+    if not raw_orders:
+        return []
+
+    try:
+        data = json.loads(raw_orders)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="orders.json is not valid JSON") from exc
+
+    if not isinstance(data, list):
+        raise HTTPException(status_code=500, detail="orders.json must contain a JSON array")
+
+    return [record for record in data if isinstance(record, dict)]
+
+
+def save_orders(orders: list[dict[str, Any]]) -> None:
+    ORDER_FILE.write_text(
+        json.dumps(orders, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def load_interview_archive() -> dict[str, dict[str, Any]]:
@@ -315,6 +378,61 @@ INTERVIEW_FIELD_FALLBACKS = {
 
 ARCHIVE_EVENT_TYPES = {"close_session", "session_close", "archive_session"}
 
+SESSION_MODE_INTERVIEW = "interview"
+SESSION_MODE_ORDER = "order"
+SESSION_MODES = {SESSION_MODE_INTERVIEW, SESSION_MODE_ORDER}
+
+ORDER_MODE_COMMANDS = {"订单", "录单", "下单", "订单模式", "开始订单", "开始录单"}
+INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "访谈模式", "结束订单", "退出订单"}
+ORDER_EXPORT_COMMANDS = {"导出订单", "订单导出", "下载订单", "订单表", "导出订单表"}
+ORDER_CONFIRM_COMMANDS = {"确认", "确认订单", "保存", "保存订单", "提交", "提交订单"}
+ORDER_CANCEL_COMMANDS = {"取消", "取消订单", "清空", "清空订单"}
+
+ORDER_TOP_LEVEL_FIELDS = [
+    "customer",
+    "delivery_date",
+    "delivery_address",
+    "contact",
+    "phone",
+    "notes",
+]
+ORDER_ITEM_FIELDS = [
+    "product",
+    "specification",
+    "quantity",
+    "unit",
+    "unit_price",
+    "amount",
+    "notes",
+]
+ORDER_EXPORT_HEADERS = [
+    "订单ID",
+    "行号",
+    "创建时间",
+    "提交人",
+    "客户",
+    "商品",
+    "规格",
+    "数量",
+    "单位",
+    "单价",
+    "金额",
+    "交付日期",
+    "交付地址",
+    "联系人",
+    "电话",
+    "备注",
+    "原始消息",
+]
+ORDER_SUMMARY_HEADERS = [
+    "客户",
+    "商品",
+    "单位",
+    "数量合计",
+    "订单行数",
+    "最近创建时间",
+]
+
 
 def clean_export_value(value: str) -> str:
     value = value.strip()
@@ -377,6 +495,302 @@ def extract_json_object(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("JSON root must be an object")
     return data
+
+
+def normalize_command(message: str) -> str:
+    return re.sub(r"\s+", "", message.strip()).lower()
+
+
+def strip_order_inline_prefix(message: str) -> str | None:
+    match = re.match(r"^\s*(订单|录单|下单)(?:\s*[：:]|\s+)(.+)$", message, flags=re.DOTALL)
+    if not match:
+        return None
+    return match.group(2).strip()
+
+
+def build_download_url(path: str) -> str:
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}{path}"
+    return path
+
+
+def build_order_export_message() -> str:
+    url = build_download_url("/exports/orders.xlsx")
+    if EXPORT_TOKEN:
+        url = f"{url}?token=导出口令"
+        return f"订单表可以导出。管理员打开这个地址并填写导出口令：{url}"
+    return f"订单表可以导出：{url}"
+
+
+def get_session_record(user_id: str) -> dict[str, Any]:
+    with SESSION_STATE_LOCK:
+        state = load_session_state()
+        record = state.get(user_id)
+        if isinstance(record, dict):
+            return dict(record)
+    return {}
+
+
+def save_session_record(user_id: str, record: dict[str, Any]) -> None:
+    record["updated_at"] = now_iso()
+    with SESSION_STATE_LOCK:
+        state = load_session_state()
+        state[user_id] = record
+        save_session_state(state)
+
+
+def get_session_mode(user_id: str) -> str:
+    mode = str(get_session_record(user_id).get("mode") or SESSION_MODE_INTERVIEW)
+    if mode not in SESSION_MODES:
+        return SESSION_MODE_INTERVIEW
+    return mode
+
+
+def set_session_mode(user_id: str, mode: str) -> None:
+    if mode not in SESSION_MODES:
+        raise ValueError(f"Invalid session mode: {mode}")
+
+    record = get_session_record(user_id)
+    record["mode"] = mode
+    save_session_record(user_id, record)
+
+
+def get_order_draft(user_id: str) -> dict[str, Any]:
+    draft = get_session_record(user_id).get("order_draft")
+    if isinstance(draft, dict):
+        return normalize_order_draft(draft)
+    return normalize_order_draft({})
+
+
+def save_order_draft(user_id: str, draft: dict[str, Any]) -> None:
+    record = get_session_record(user_id)
+    record["mode"] = SESSION_MODE_ORDER
+    record["order_draft"] = normalize_order_draft(draft)
+    save_session_record(user_id, record)
+
+
+def clear_order_draft(user_id: str) -> None:
+    record = get_session_record(user_id)
+    record["mode"] = SESSION_MODE_ORDER
+    record.pop("order_draft", None)
+    save_session_record(user_id, record)
+
+
+def clean_order_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return clean_export_value(str(value))
+
+
+def normalize_order_item(item: dict[str, Any]) -> dict[str, str]:
+    return {field: clean_order_value(item.get(field)) for field in ORDER_ITEM_FIELDS}
+
+
+def normalize_order_draft(data: dict[str, Any]) -> dict[str, Any]:
+    draft: dict[str, Any] = {
+        field: clean_order_value(data.get(field))
+        for field in ORDER_TOP_LEVEL_FIELDS
+    }
+
+    items = data.get("items")
+    if not isinstance(items, list):
+        if any(data.get(field) for field in ORDER_ITEM_FIELDS):
+            items = [data]
+        else:
+            items = []
+
+    normalized_items = [
+        normalize_order_item(item)
+        for item in items
+        if isinstance(item, dict)
+    ]
+    draft["items"] = [
+        item
+        for item in normalized_items
+        if any(item.get(field) for field in ORDER_ITEM_FIELDS)
+    ]
+
+    raw_messages = data.get("raw_messages")
+    if isinstance(raw_messages, list):
+        draft["raw_messages"] = [clean_order_value(message) for message in raw_messages if clean_order_value(message)]
+    elif data.get("raw_message"):
+        draft["raw_messages"] = [clean_order_value(data.get("raw_message"))]
+    else:
+        draft["raw_messages"] = []
+
+    return draft
+
+
+def order_draft_missing_fields(draft: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not draft.get("customer"):
+        missing.append("客户")
+
+    items = draft.get("items")
+    if not isinstance(items, list) or not items:
+        missing.append("商品和数量")
+        return missing
+
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            missing.append(f"第{index}项商品")
+            continue
+        if not item.get("product"):
+            missing.append(f"第{index}项商品")
+        if not item.get("quantity"):
+            missing.append(f"第{index}项数量")
+
+    return missing
+
+
+def format_order_draft_summary(draft: dict[str, Any]) -> str:
+    lines = [
+        f"客户：{draft.get('customer') or '未填写'}",
+    ]
+
+    delivery_date = draft.get("delivery_date")
+    if delivery_date:
+        lines.append(f"交付日期：{delivery_date}")
+
+    delivery_address = draft.get("delivery_address")
+    if delivery_address:
+        lines.append(f"交付地址：{delivery_address}")
+
+    contact = draft.get("contact")
+    phone = draft.get("phone")
+    if contact or phone:
+        lines.append(f"联系人：{contact or '未填写'} {phone or ''}".strip())
+
+    items = draft.get("items") if isinstance(draft.get("items"), list) else []
+    if not items:
+        lines.append("商品：未填写")
+    else:
+        lines.append("商品：")
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            parts = [
+                item.get("product") or "未填写商品",
+                item.get("specification") or "",
+                f"{item.get('quantity') or '未填写数量'}{item.get('unit') or ''}",
+            ]
+            price = item.get("unit_price")
+            amount = item.get("amount")
+            if price:
+                parts.append(f"单价{price}")
+            if amount:
+                parts.append(f"金额{amount}")
+            item_notes = item.get("notes")
+            if item_notes:
+                parts.append(item_notes)
+            lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
+
+    notes = draft.get("notes")
+    if notes:
+        lines.append(f"备注：{notes}")
+
+    return "\n".join(lines)
+
+
+def llm_parse_order_draft(existing_draft: dict[str, Any], message: str) -> dict[str, Any]:
+    prompt = f"""
+你是食品、餐饮供应链的订单录入助手。请把员工发来的微信订单整理成 JSON 草稿。
+
+只输出一个 JSON 对象，不要输出解释，不要使用 Markdown。
+
+JSON 字段：
+- customer：客户/门店/收货方名称
+- delivery_date：交付/配送日期或时间，保留原文
+- delivery_address：交付地址
+- contact：联系人
+- phone：电话
+- notes：整单备注
+- items：数组，每个元素包含 product, specification, quantity, unit, unit_price, amount, notes
+
+规则：
+- 结合“已有草稿”和“新消息”做合并；新消息是补充或修改时，用新消息覆盖对应字段。
+- 多个商品必须拆成多个 items。
+- 数量、单位、单价、金额都保留用户原文，不要自己换算。
+- 信息没出现就留空字符串，不要编造。
+- 如果用户说“再加”“加上”，通常是在已有 items 基础上新增商品。
+- 如果文本像“老三家要鸡腿20件”，customer 是“老三家”，product 是“鸡腿”，quantity 是“20”，unit 是“件”。
+
+已有草稿：
+{json.dumps(existing_draft, ensure_ascii=False)}
+
+新消息：
+{message}
+""".strip()
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "你只输出可解析 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+    )
+    raw = response.choices[0].message.content or ""
+    return normalize_order_draft(extract_json_object(raw))
+
+
+def generate_order_id(user_id: str) -> str:
+    digest = hashlib.sha1(f"{user_id}:{time.time()}".encode("utf-8")).hexdigest()[:6].upper()
+    return f"OD{datetime.now().strftime('%Y%m%d%H%M%S')}-{digest}"
+
+
+def build_order_records_from_draft(user_id: str, draft: dict[str, Any]) -> list[dict[str, str]]:
+    order_id = generate_order_id(user_id)
+    created_at = now_iso()
+    raw_message = "\n".join(str(message) for message in draft.get("raw_messages", []) if message)
+    records: list[dict[str, str]] = []
+
+    for line_no, item in enumerate(draft.get("items", []), start=1):
+        if not isinstance(item, dict):
+            continue
+        records.append(
+            {
+                "order_id": order_id,
+                "line_no": str(line_no),
+                "created_at": created_at,
+                "submitted_by": user_id,
+                "customer": str(draft.get("customer") or ""),
+                "product": str(item.get("product") or ""),
+                "specification": str(item.get("specification") or ""),
+                "quantity": str(item.get("quantity") or ""),
+                "unit": str(item.get("unit") or ""),
+                "unit_price": str(item.get("unit_price") or ""),
+                "amount": str(item.get("amount") or ""),
+                "delivery_date": str(draft.get("delivery_date") or ""),
+                "delivery_address": str(draft.get("delivery_address") or ""),
+                "contact": str(draft.get("contact") or ""),
+                "phone": str(draft.get("phone") or ""),
+                "notes": str(draft.get("notes") or item.get("notes") or ""),
+                "raw_message": raw_message,
+            }
+        )
+
+    return records
+
+
+def save_confirmed_order(user_id: str, draft: dict[str, Any]) -> tuple[str, int]:
+    records = build_order_records_from_draft(user_id, draft)
+    if not records:
+        raise ValueError("order draft has no items")
+
+    with ORDER_LOCK:
+        orders = load_orders()
+        orders.extend(records)
+        save_orders(orders)
+
+    return records[0]["order_id"], len(records)
+
+
+def user_order_count(user_id: str) -> int:
+    with ORDER_LOCK:
+        return sum(1 for record in load_orders() if str(record.get("submitted_by")) == user_id)
 
 
 def normalize_interview_record(record: dict[str, Any]) -> dict[str, str]:
@@ -754,6 +1168,170 @@ def build_interview_export() -> Path:
     return output_path
 
 
+def collect_order_records() -> list[dict[str, str]]:
+    with ORDER_LOCK:
+        records = load_orders()
+
+    normalized_records: list[dict[str, str]] = []
+    export_fields = [
+        "order_id",
+        "line_no",
+        "created_at",
+        "submitted_by",
+        "customer",
+        "product",
+        "specification",
+        "quantity",
+        "unit",
+        "unit_price",
+        "amount",
+        "delivery_date",
+        "delivery_address",
+        "contact",
+        "phone",
+        "notes",
+        "raw_message",
+    ]
+    for record in records:
+        normalized_records.append({field: str(record.get(field) or "") for field in export_fields})
+    return normalized_records
+
+
+def order_record_to_export_row(record: dict[str, str]) -> list[str]:
+    return [
+        record["order_id"],
+        record["line_no"],
+        record["created_at"],
+        record["submitted_by"],
+        record["customer"],
+        record["product"],
+        record["specification"],
+        record["quantity"],
+        record["unit"],
+        record["unit_price"],
+        record["amount"],
+        record["delivery_date"],
+        record["delivery_address"],
+        record["contact"],
+        record["phone"],
+        record["notes"],
+        record["raw_message"],
+    ]
+
+
+def parse_quantity_number(value: str) -> float | None:
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def format_quantity_total(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def build_order_summary_rows(records: list[dict[str, str]]) -> list[list[str]]:
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for record in records:
+        key = (record["customer"], record["product"], record["unit"])
+        group = groups.setdefault(
+            key,
+            {
+                "total": 0.0,
+                "numeric_count": 0,
+                "raw_quantities": [],
+                "count": 0,
+                "latest_created_at": "",
+            },
+        )
+        group["count"] += 1
+        quantity = record["quantity"]
+        number = parse_quantity_number(quantity)
+        if number is None:
+            if quantity:
+                group["raw_quantities"].append(quantity)
+        else:
+            group["total"] += number
+            group["numeric_count"] += 1
+        if record["created_at"] > group["latest_created_at"]:
+            group["latest_created_at"] = record["created_at"]
+
+    rows: list[list[str]] = []
+    for (customer, product, unit), group in sorted(groups.items()):
+        quantity_parts: list[str] = []
+        if group["numeric_count"]:
+            quantity_parts.append(format_quantity_total(float(group["total"])))
+        if group["raw_quantities"]:
+            quantity_parts.append("、".join(group["raw_quantities"]))
+        rows.append(
+            [
+                customer,
+                product,
+                unit,
+                "；".join(quantity_parts),
+                str(group["count"]),
+                str(group["latest_created_at"]),
+            ]
+        )
+    return rows
+
+
+def write_order_table_sheet(sheet, headers: list[str], rows: list[list[str]], widths: list[int]) -> None:
+    sheet.append(headers)
+    for row in rows:
+        sheet.append(row)
+
+    header_fill = PatternFill("solid", fgColor="2F5597")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+    for index, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+
+
+def build_order_export() -> Path:
+    records = collect_order_records()
+
+    workbook = Workbook()
+    detail_sheet = workbook.active
+    detail_sheet.title = "全部订单"
+    detail_rows = [order_record_to_export_row(record) for record in records]
+    write_order_table_sheet(
+        detail_sheet,
+        ORDER_EXPORT_HEADERS,
+        detail_rows,
+        [18, 8, 20, 28, 22, 24, 18, 12, 10, 12, 12, 18, 30, 16, 16, 30, 60],
+    )
+
+    summary_sheet = workbook.create_sheet("按客户商品汇总")
+    write_order_table_sheet(
+        summary_sheet,
+        ORDER_SUMMARY_HEADERS,
+        build_order_summary_rows(records),
+        [24, 26, 10, 16, 12, 20],
+    )
+
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = EXPORT_DIR / f"orders-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    workbook.save(output_path)
+    return output_path
+
+
 def trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
     return history[-MAX_HISTORY_MESSAGES:]
 
@@ -815,6 +1393,92 @@ def call_llm(user_id: str, history: list[dict[str, str]]) -> str:
     return answer or ""
 
 
+def handle_order_user_message(user_id: str, message: str) -> ChatResponse:
+    command = normalize_command(message)
+    history_length = user_order_count(user_id)
+
+    if command in ORDER_CANCEL_COMMANDS:
+        clear_order_draft(user_id)
+        return ChatResponse(
+            user_id=user_id,
+            answer="已清空当前订单草稿。你可以直接发送下一张订单。",
+            history_length=history_length,
+        )
+
+    if command in ORDER_CONFIRM_COMMANDS:
+        draft = get_order_draft(user_id)
+        missing = order_draft_missing_fields(draft)
+        if missing:
+            return ChatResponse(
+                user_id=user_id,
+                answer=(
+                    "当前订单还不能保存，缺少："
+                    + "、".join(missing)
+                    + "\n"
+                    + format_order_draft_summary(draft)
+                    + "\n请直接补充缺失信息，或发“取消”清空。"
+                ),
+                history_length=history_length,
+            )
+
+        try:
+            order_id, line_count = save_confirmed_order(user_id, draft)
+        except Exception as exc:
+            logger.warning("order_save_failed user_id=%s error=%s", user_id, exc)
+            return ChatResponse(
+                user_id=user_id,
+                answer="订单保存失败了，请稍后再试，或联系管理员查看后台日志。",
+                history_length=history_length,
+            )
+
+        clear_order_draft(user_id)
+        return ChatResponse(
+            user_id=user_id,
+            answer=f"已保存订单 {order_id}，共 {line_count} 行商品。继续发下一张订单即可。",
+            history_length=history_length + line_count,
+        )
+
+    existing_draft = get_order_draft(user_id)
+    try:
+        draft = llm_parse_order_draft(existing_draft, message)
+    except Exception as exc:
+        logger.warning("order_parse_failed user_id=%s error=%s", user_id, exc)
+        return ChatResponse(
+            user_id=user_id,
+            answer="这条订单我没有解析成功。请按“客户 + 商品 + 数量”的格式重发，例如：老三家 鸡腿 20件，明早送。",
+            history_length=history_length,
+        )
+
+    raw_messages = list(existing_draft.get("raw_messages", []))
+    raw_messages.append(message)
+    draft["raw_messages"] = raw_messages[-20:]
+    draft = normalize_order_draft(draft)
+    save_order_draft(user_id, draft)
+
+    missing = order_draft_missing_fields(draft)
+    summary = format_order_draft_summary(draft)
+    if missing:
+        answer = (
+            "我先整理成订单草稿，还缺："
+            + "、".join(missing)
+            + "\n"
+            + summary
+            + "\n请直接补充缺失信息，或发“取消”清空。"
+        )
+    else:
+        answer = (
+            "我整理成待确认订单：\n"
+            + summary
+            + "\n确认无误请回复“确认”；要修改就直接发修改内容。"
+        )
+
+    return ChatResponse(
+        user_id=user_id,
+        answer=answer,
+        history_length=history_length,
+    )
+
+
 def handle_user_message(user_id: str, message: str) -> ChatResponse:
     user_id = user_id.strip()
     message = message.strip()
@@ -823,6 +1487,39 @@ def handle_user_message(user_id: str, message: str) -> ChatResponse:
         raise HTTPException(status_code=400, detail="user_id cannot be empty")
     if not message:
         raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    command = normalize_command(message)
+    inline_order_message = strip_order_inline_prefix(message)
+
+    if command in ORDER_EXPORT_COMMANDS:
+        return ChatResponse(
+            user_id=user_id,
+            answer=build_order_export_message(),
+            history_length=user_order_count(user_id),
+        )
+
+    if command in ORDER_MODE_COMMANDS:
+        set_session_mode(user_id, SESSION_MODE_ORDER)
+        return ChatResponse(
+            user_id=user_id,
+            answer="已切换到订单模式。请发送订单内容；确认前我会先整理成草稿。发“问诊”可切回问诊模式。",
+            history_length=user_order_count(user_id),
+        )
+
+    if inline_order_message is not None:
+        set_session_mode(user_id, SESSION_MODE_ORDER)
+        return handle_order_user_message(user_id, inline_order_message)
+
+    if command in INTERVIEW_MODE_COMMANDS:
+        set_session_mode(user_id, SESSION_MODE_INTERVIEW)
+        return ChatResponse(
+            user_id=user_id,
+            answer="已切换到问诊模式。可以继续按原来的访谈流程沟通。",
+            history_length=0,
+        )
+
+    if get_session_mode(user_id) == SESSION_MODE_ORDER:
+        return handle_order_user_message(user_id, message)
 
     with MEMORY_LOCK:
         memory = load_memory()
@@ -1661,6 +2358,18 @@ def export_interviews(request: Request):
     require_export_token(request)
 
     output_path = build_interview_export()
+    return FileResponse(
+        output_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=output_path.name,
+    )
+
+
+@app.get("/exports/orders.xlsx")
+def export_orders(request: Request):
+    require_export_token(request)
+
+    output_path = build_order_export()
     return FileResponse(
         output_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
