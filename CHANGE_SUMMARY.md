@@ -23,7 +23,7 @@ GET /api/receipts
 
 真实 token 只放在云端 `.env` 和 Web 工具 `.env`，机器人和 Web 工具必须使用同一个。
 
-## 2. 照片识别改成 DeepSeek 路线
+## 2. 照片识别改成 Qwen 路线
 
 不再默认使用 `gpt-4o-mini`，照片识别走可配置的 OpenAI-compatible 视觉模型。
 

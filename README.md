@@ -5,7 +5,7 @@
 当前阶段只做 AI backend 部署准备：
 
 - FastAPI 后端
-- OpenAI-compatible SDK 调用 DeepSeek
+- OpenAI-compatible SDK 调用 Qwen / DashScope
 - `user_id` 级别的本地记忆
 - `memory.json` 持久化
 - Swagger `/docs` 测试
@@ -43,12 +43,12 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-DeepSeek 配置示例：
+Qwen / DashScope 配置示例：
 
 ```env
-LLM_API_KEY=your_deepseek_api_key
-LLM_BASE_URL=https://api.deepseek.com
-MODEL_NAME=deepseek-chat
+LLM_API_KEY=your_qwen_or_dashscope_api_key
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=qwen3-vl-plus
 MAX_HISTORY_MESSAGES=20
 SYSTEM_PROMPT=你是一个运行在微信里的 AI 助手，回答要简洁、有帮助。
 ```
@@ -252,9 +252,9 @@ startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
 在 Render Dashboard 的 Environment 里配置：
 
 ```text
-LLM_API_KEY=your_deepseek_api_key
-LLM_BASE_URL=https://api.deepseek.com
-MODEL_NAME=deepseek-chat
+LLM_API_KEY=your_qwen_or_dashscope_api_key
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=qwen3-vl-plus
 MAX_HISTORY_MESSAGES=20
 SYSTEM_PROMPT=你是一个运行在微信里的 AI 助手，回答要简洁、有帮助。
 ```

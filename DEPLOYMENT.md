@@ -21,9 +21,9 @@ FastAPI 只监听本机地址，不直接暴露公网。
 机器人 `.env` 至少配置：
 
 ```env
-LLM_API_KEY=your_deepseek_api_key
-LLM_BASE_URL=https://api.deepseek.com
-MODEL_NAME=deepseek-chat
+LLM_API_KEY=your_qwen_or_dashscope_api_key
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=qwen3-vl-plus
 
 ROBOT_API_TOKEN=<ROBOT_API_TOKEN>
 ORDER_DB_FILE=orders.db

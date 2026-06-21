@@ -34,8 +34,8 @@ from wx_crypt import WXBizMsgCrypt, WxChannel_Wecom
 
 load_dotenv()
 
-DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL_NAME = "deepseek-chat"
+DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL_NAME = "qwen3-vl-plus"
 DEFAULT_MAX_HISTORY_MESSAGES = 20
 DEFAULT_SYSTEM_PROMPT = "你是一个运行在微信里的 AI 助手，回答要简洁、有帮助。"
 DEFAULT_WECOM_BOT_NAME = "食品厂机器人"

@@ -8,9 +8,9 @@ services:
       - key: LLM_API_KEY
         sync: false
       - key: LLM_BASE_URL
-        value: https://api.deepseek.com
+        value: https://dashscope.aliyuncs.com/compatible-mode/v1
       - key: MODEL_NAME
-        value: deepseek-chat
+        value: qwen3-vl-plus
       - key: MAX_HISTORY_MESSAGES
         value: "20"
       - key: SYSTEM_PROMPT
