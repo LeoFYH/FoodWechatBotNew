@@ -37,7 +37,7 @@ load_dotenv()
 DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL_NAME = "qwen3-vl-plus"
 DEFAULT_MAX_HISTORY_MESSAGES = 20
-DEFAULT_SYSTEM_PROMPT = "你是一个运行在微信里的 AI 助手，回答要简洁、有帮助。"
+DEFAULT_SYSTEM_PROMPT = "你是运行在微信里的公司客服助手。说话自然、简洁，像真人客服；客户闲聊可以接一两句，但不要把客服窗口变成闲聊室。涉及价格、交期、投诉、纠纷、退款、发票等事项，不要瞎承诺，明确转人工处理。"
 DEFAULT_WECOM_BOT_NAME = "食品厂机器人"
 DEFAULT_WECOM_KF_SYNC_LIMIT = 100
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
@@ -310,6 +310,7 @@ def init_order_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_kind ON order_entries(kind)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_order_date ON order_entries(order_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_status_order_date ON order_entries(status, order_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_raw_ref ON order_entries(raw_ref)")
         rows = conn.execute(
             "SELECT id, payload_json, created_at FROM order_entries WHERE order_date = ''"
         ).fetchall()
@@ -417,8 +418,8 @@ def query_order_payloads(
     ids: list[int] | None = None,
     order_date: str | None = None,
 ) -> list[dict[str, Any]]:
-    clauses = ["confirmed = 1"]
-    params: list[Any] = []
+    clauses = ["confirmed = 1", "status != ?"]
+    params: list[Any] = [ORDER_STATUS_CANCELLED]
     if ids:
         placeholders = ",".join("?" for _ in ids)
         clauses.append(f"id IN ({placeholders})")
@@ -449,8 +450,8 @@ def mark_order_payloads_fetched(ids: list[int]) -> dict[str, list[int]]:
     with ORDER_DB_LOCK:
         with order_db_connection() as conn:
             existing_rows = conn.execute(
-                f"SELECT id FROM order_entries WHERE id IN ({placeholders})",
-                clean_ids,
+                f"SELECT id FROM order_entries WHERE id IN ({placeholders}) AND status != ?",
+                [*clean_ids, ORDER_STATUS_CANCELLED],
             ).fetchall()
             existing_ids = {int(row["id"]) for row in existing_rows}
             succeeded = [order_id for order_id in clean_ids if order_id in existing_ids]
@@ -484,6 +485,146 @@ def mark_order_payloads_fetched(ids: list[int]) -> dict[str, list[int]]:
             return {"succeeded": succeeded, "failed": failed}
 
 
+def raw_ref_belongs_to_user(raw_ref: str, user_id: str) -> bool:
+    raw_ref = str(raw_ref or "")
+    return raw_ref == user_id or raw_ref.startswith(f"{user_id}:")
+
+
+def summarize_order_for_reply(payload: dict[str, Any]) -> str:
+    store = str(payload.get("store") or "未填门店")
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    if not items:
+        return store
+    first = items[0] if isinstance(items[0], dict) else {}
+    name = str(first.get("name") or "未填商品")
+    qty = first.get("qty")
+    unit = str(first.get("unit") or "")
+    qty_text = "" if qty is None else f"{qty}{unit}"
+    more = "" if len(items) == 1 else f"等{len(items)}项"
+    return f"{store} {name}{qty_text}{more}".strip()
+
+
+def cancel_latest_order_for_user(user_id: str) -> str:
+    with ORDER_DB_LOCK:
+        with order_db_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM order_entries
+                WHERE confirmed = 1
+                  AND status != ?
+                  AND (raw_ref = ? OR raw_ref LIKE ?)
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (ORDER_STATUS_CANCELLED, user_id, f"{user_id}:%"),
+            ).fetchall()
+            if not rows:
+                return "没找到你最近确认的订单，暂时没有可撤回的。"
+
+            row = rows[0]
+            payload = row_to_order_payload(row)
+            status = str(row["status"] or payload.get("status") or "")
+            if status == ORDER_STATUS_FETCHED:
+                return "这单已被排产/发货使用，不能直接撤回，需要联系数据部处理。"
+
+            payload["status"] = ORDER_STATUS_CANCELLED
+            payload["cancelled_at"] = now_iso()
+            conn.execute(
+                """
+                UPDATE order_entries
+                SET status = ?, payload_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    ORDER_STATUS_CANCELLED,
+                    json.dumps(payload, ensure_ascii=False),
+                    now_iso(),
+                    int(row["id"]),
+                ),
+            )
+            conn.commit()
+            return f"好，刚那单（{summarize_order_for_reply(payload)}）撤回了，重新发我吧。"
+
+
+def summarize_receipt_for_reply(payload: dict[str, Any]) -> str:
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    if not items:
+        return str(payload.get("date") or "今天")
+    first = items[0] if isinstance(items[0], dict) else {}
+    name = str(first.get("name") or "未填成品")
+    qty = first.get("qty")
+    unit = str(first.get("unit") or "")
+    qty_text = "" if qty is None else f"{qty}{unit}"
+    more = "" if len(items) == 1 else f"等{len(items)}项"
+    return f"{name}{qty_text}{more}".strip()
+
+
+def cancel_latest_receipt_for_user(user_id: str) -> str:
+    today = datetime.now().date().isoformat()
+    with RECEIPT_DB_LOCK:
+        with receipt_db_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM receipt_entries
+                WHERE date = ? AND status != 'cancelled'
+                ORDER BY id DESC
+                """,
+                (today,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                except json.JSONDecodeError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                if not raw_ref_belongs_to_user(str(payload.get("raw_ref") or ""), user_id):
+                    continue
+
+                payload["status"] = ORDER_STATUS_CANCELLED
+                payload["cancelled_at"] = now_iso()
+                conn.execute(
+                    """
+                    UPDATE receipt_entries
+                    SET status = 'cancelled', payload_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(payload, ensure_ascii=False), now_iso(), int(row["id"])),
+                )
+                conn.commit()
+                return f"好，刚那条入库记录（{summarize_receipt_for_reply(payload)}）撤回了。"
+    return "没找到你今天确认的入库记录，暂时没有可撤回的。"
+
+
+def order_draft_has_content(draft: dict[str, Any]) -> bool:
+    if not isinstance(draft, dict):
+        return False
+    if draft.get("store"):
+        return True
+    items = draft.get("items") if isinstance(draft.get("items"), list) else []
+    return any(
+        isinstance(item, dict) and (item.get("name") or item.get("qty") is not None)
+        for item in items
+    )
+
+
+def receipt_draft_has_content(draft: dict[str, Any]) -> bool:
+    if not isinstance(draft, dict):
+        return False
+    items = draft.get("items") if isinstance(draft.get("items"), list) else []
+    return any(
+        isinstance(item, dict) and (item.get("name") or item.get("qty") is not None)
+        for item in items
+    )
+
+
+def missing_fields_reply(missing: list[str], *, receipt: bool = False) -> str:
+    if not missing:
+        return ""
+    subject = "这条入库记录" if receipt else "这单"
+    return f"{subject}还差：{'、'.join(missing)}。补我一下就行，发“取消”可以清空草稿。"
+
+
 def init_receipt_db() -> None:
     RECEIPT_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(RECEIPT_DB_FILE) as conn:
@@ -493,13 +634,21 @@ def init_receipt_db() -> None:
             CREATE TABLE IF NOT EXISTS receipt_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'confirmed',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             )
             """
         )
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(receipt_entries)").fetchall()
+        }
+        if "status" not in columns:
+            conn.execute("ALTER TABLE receipt_entries ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_entries_date ON receipt_entries(date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_entries_status_date ON receipt_entries(status, date)")
         conn.commit()
 
 
@@ -600,12 +749,13 @@ def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
             cursor = conn.execute(
                 """
                 INSERT INTO receipt_entries (
-                    date, created_at, updated_at, payload_json
+                    date, status, created_at, updated_at, payload_json
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     str(normalized.get("date") or ""),
+                    str(normalized.get("status") or "confirmed"),
                     str(normalized.get("created_at") or now_iso()),
                     now_iso(),
                     json.dumps(normalized, ensure_ascii=False),
@@ -628,7 +778,7 @@ def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def query_receipt_payloads(date: str) -> list[dict[str, Any]]:
     with receipt_db_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM receipt_entries WHERE date = ? ORDER BY id ASC",
+            "SELECT * FROM receipt_entries WHERE date = ? AND status != 'cancelled' ORDER BY id ASC",
             (date,),
         ).fetchall()
     return [row_to_receipt_payload(row) for row in rows]
@@ -743,10 +893,13 @@ SESSION_MODES = {SESSION_MODE_INTERVIEW, SESSION_MODE_ORDER, SESSION_MODE_RECEIP
 
 ORDER_MODE_COMMANDS = {"订单", "录单", "下单", "订单模式", "开始订单", "开始录单"}
 RECEIPT_MODE_COMMANDS = {"入库", "入库模式", "产成品入库", "开始入库", "成品入库"}
-INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "访谈模式", "结束订单", "退出订单", "结束入库", "退出入库"}
+INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "访谈模式", "普通模式", "聊天"}
+EXIT_MODE_COMMANDS = {"退出", "结束", "不弄了", "算了", "返回", "退出订单", "退出入库", "结束订单", "结束入库"}
+STATUS_COMMANDS = {"状态", "我在哪", "我在哪儿", "当前状态", "现在状态", "现在是什么模式"}
+REVOKE_COMMANDS = {"撤回", "撤回上一单", "删了上一单", "删了", "刚那个不对", "刚才那个不对", "上一单不对"}
 ORDER_EXPORT_COMMANDS = {"导出订单", "订单导出", "下载订单", "订单表", "导出订单表"}
 ORDER_CONFIRM_COMMANDS = {"确认", "确认订单", "保存", "保存订单", "提交", "提交订单"}
-ORDER_CANCEL_COMMANDS = {"取消", "取消订单", "清空", "清空订单"}
+ORDER_CANCEL_COMMANDS = {"取消", "取消订单", "取消草稿", "清空", "清空订单", "清空草稿", "不要了"}
 
 ORDER_KIND_BASE = "base"
 ORDER_KIND_PATCH = "patch"
@@ -755,6 +908,7 @@ ORDER_SOURCE_PHOTO = "photo"
 ORDER_SOURCE_TEXT = "text"
 ORDER_STATUS_NEW = "new"
 ORDER_STATUS_FETCHED = "fetched"
+ORDER_STATUS_CANCELLED = "cancelled"
 ORDER_STATUS_ALL = "all"
 ORDER_CHANGE_ADD = "add"
 ORDER_CHANGE_MODIFY = "modify"
@@ -933,6 +1087,121 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 def normalize_command(message: str) -> str:
     return re.sub(r"\s+", "", message.strip()).lower()
+
+
+def command_contains_any(command: str, keywords: set[str]) -> bool:
+    return any(keyword and keyword in command for keyword in keywords)
+
+
+def is_exit_mode_command(command: str) -> bool:
+    return command in EXIT_MODE_COMMANDS or command_contains_any(
+        command,
+        {"不弄", "算了", "退出", "返回普通", "结束订单", "结束入库"},
+    )
+
+
+def is_revoke_command(command: str) -> bool:
+    return command in REVOKE_COMMANDS or command_contains_any(
+        command,
+        {"撤回", "删了", "删除上一", "刚那个不对", "刚才那个不对", "上一单不对"},
+    )
+
+
+def is_status_command(command: str) -> bool:
+    return command in STATUS_COMMANDS
+
+
+def mode_display_name(mode: str) -> str:
+    if mode == SESSION_MODE_ORDER:
+        return "订单模式"
+    if mode == SESSION_MODE_RECEIPT:
+        return "入库模式"
+    return "普通聊天模式"
+
+
+def clear_current_business_draft(user_id: str, mode: str | None = None) -> None:
+    mode = mode or get_session_mode(user_id)
+    record = get_session_record(user_id)
+    if mode == SESSION_MODE_ORDER:
+        record.pop("order_draft", None)
+    elif mode == SESSION_MODE_RECEIPT:
+        record.pop("receipt_draft", None)
+    else:
+        record.pop("order_draft", None)
+        record.pop("receipt_draft", None)
+    save_session_record(user_id, record)
+
+
+def exit_business_mode(user_id: str) -> str:
+    previous_mode = get_session_mode(user_id)
+    record = get_session_record(user_id)
+    record["mode"] = SESSION_MODE_INTERVIEW
+    record.pop("order_draft", None)
+    record.pop("receipt_draft", None)
+    save_session_record(user_id, record)
+    if previous_mode == SESSION_MODE_ORDER:
+        return "已退出订单模式，有事随时叫我。"
+    if previous_mode == SESSION_MODE_RECEIPT:
+        return "已退出入库模式，有事随时叫我。"
+    return "现在是普通聊天模式。"
+
+
+def build_status_message(user_id: str) -> str:
+    mode = get_session_mode(user_id)
+    record = get_session_record(user_id)
+    draft_text = "没有待确认草稿"
+    if isinstance(record.get("order_draft"), dict):
+        draft_text = "有一份订单草稿待确认"
+    if isinstance(record.get("receipt_draft"), dict):
+        draft_text = "有一份入库草稿待确认"
+    return f"你现在在{mode_display_name(mode)}，{draft_text}。"
+
+
+ORDER_LIKE_KEYWORDS = {
+    "加",
+    "订",
+    "下单",
+    "补",
+    "追",
+    "改",
+    "换",
+    "馄饨",
+    "小鱼",
+    "鸡汤",
+    "虾肉",
+    "鼓楼",
+    "门店",
+    "箱",
+    "件",
+    "袋",
+    "盒",
+    "包",
+}
+
+
+def looks_like_order_message(message: str) -> bool:
+    text = message.strip()
+    command = normalize_command(text)
+    if not text:
+        return False
+    if strip_order_inline_prefix(text) is not None:
+        return True
+    if re.search(r"\d+(?:\.\d+)?\s*(箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)", text):
+        return True
+    if re.search(r"(加|订|下单|补|追|改|换).*\d+", text):
+        return True
+    if command_contains_any(command, ORDER_LIKE_KEYWORDS) and re.search(r"\d", text):
+        return True
+    return False
+
+
+def append_mode_hint(answer: str, mode: str) -> str:
+    answer = answer.strip()
+    if mode == SESSION_MODE_ORDER:
+        return f"{answer}\n\n你还在订单模式，要下单直接发订单文字、Excel 或照片；发“退出”可返回普通聊天。"
+    if mode == SESSION_MODE_RECEIPT:
+        return f"{answer}\n\n你还在入库模式，要记入库就发产成品照片；发“退出”可返回普通聊天。"
+    return answer
 
 
 def strip_order_inline_prefix(message: str) -> str | None:
@@ -2312,17 +2581,17 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
 
     if command in ORDER_CONFIRM_COMMANDS:
         draft = get_order_draft(user_id)
+        if not order_draft_has_content(draft):
+            return ChatResponse(
+                user_id=user_id,
+                answer="现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。",
+                history_length=history_length,
+            )
         missing = order_draft_missing_fields(draft)
         if missing:
             return ChatResponse(
                 user_id=user_id,
-                answer=(
-                    "当前订单还不能保存，缺少："
-                    + "、".join(missing)
-                    + "\n"
-                    + format_order_draft_summary(draft)
-                    + "\n请直接补充缺失信息，或发“取消”清空。"
-                ),
+                answer=missing_fields_reply(missing),
                 history_length=history_length,
             )
 
@@ -2366,13 +2635,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
     missing = order_draft_missing_fields(draft)
     summary = format_order_draft_summary(draft)
     if missing:
-        answer = (
-            "我先整理成订单草稿，还缺："
-            + "、".join(missing)
-            + "\n"
-            + summary
-            + "\n请直接补充缺失信息，或发“取消”清空。"
-        )
+        answer = missing_fields_reply(missing)
     else:
         answer = (
             "我整理成待确认订单：\n"
@@ -2423,17 +2686,17 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
 
     if command in ORDER_CONFIRM_COMMANDS:
         draft = get_receipt_draft(user_id)
+        if not receipt_draft_has_content(draft):
+            return ChatResponse(
+                user_id=user_id,
+                answer="现在没有待确认的入库草稿。发产成品入库照片给我就行。",
+                history_length=0,
+            )
         missing = receipt_missing_fields(draft)
         if missing:
             return ChatResponse(
                 user_id=user_id,
-                answer=(
-                    "当前入库记录还不能保存，缺少："
-                    + "、".join(missing)
-                    + "\n"
-                    + format_receipt_draft_summary(draft)
-                    + "\n请重新发送清晰照片，或发“取消”清空。"
-                ),
+                answer=missing_fields_reply(missing, receipt=True),
                 history_length=0,
             )
 
@@ -2476,13 +2739,7 @@ def handle_receipt_photo_input(user_id: str, image_bytes: bytes, mime_type: str 
     missing = receipt_missing_fields(draft)
     summary = format_receipt_draft_summary(draft)
     if missing:
-        answer = (
-            "我先把照片识别成入库草稿，还缺："
-            + "、".join(missing)
-            + "\n"
-            + summary
-            + "\n请重新发送清晰照片，或发“取消”清空。"
-        )
+        answer = missing_fields_reply(missing, receipt=True)
     else:
         answer = (
             "我把照片识别成待确认入库记录：\n"
@@ -2492,58 +2749,20 @@ def handle_receipt_photo_input(user_id: str, image_bytes: bytes, mime_type: str 
     return ChatResponse(user_id=user_id, answer=answer, history_length=0)
 
 
-def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) -> ChatResponse:
-    user_id = user_id.strip()
-    message = message.strip()
-
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id cannot be empty")
-    if not message:
-        raise HTTPException(status_code=400, detail="message cannot be empty")
-
+def needs_human_transfer(message: str) -> bool:
     command = normalize_command(message)
-    inline_order_message = strip_order_inline_prefix(message)
+    return command_contains_any(
+        command,
+        {"价格", "多少钱", "报价", "投诉", "赔", "纠纷", "发票", "退款", "催单", "交期", "合同"},
+    )
 
-    if command in ORDER_EXPORT_COMMANDS:
-        return ChatResponse(
-            user_id=user_id,
-            answer=build_order_export_message(),
-            history_length=user_order_count(user_id),
-        )
 
-    if command in ORDER_MODE_COMMANDS:
-        set_session_mode(user_id, SESSION_MODE_ORDER)
-        return ChatResponse(
-            user_id=user_id,
-            answer="已切换到订单模式。请发送订单内容；确认前我会先整理成草稿。发“问诊”可切回问诊模式。",
-            history_length=user_order_count(user_id),
-        )
-
-    if command in RECEIPT_MODE_COMMANDS:
-        set_session_mode(user_id, SESSION_MODE_RECEIPT)
-        return ChatResponse(
-            user_id=user_id,
-            answer="已切换到入库模式。请发送产成品入库照片；识别后我会先整理成草稿让你确认。发“订单”可切回订单模式。",
-            history_length=0,
-        )
-
-    if inline_order_message is not None:
-        set_session_mode(user_id, SESSION_MODE_ORDER)
-        return handle_order_user_message(user_id, inline_order_message, raw_ref=raw_ref)
-
-    if command in INTERVIEW_MODE_COMMANDS:
-        set_session_mode(user_id, SESSION_MODE_INTERVIEW)
-        return ChatResponse(
-            user_id=user_id,
-            answer="已切换到问诊模式。可以继续按原来的访谈流程沟通。",
-            history_length=0,
-        )
-
-    if get_session_mode(user_id) == SESSION_MODE_ORDER:
-        return handle_order_user_message(user_id, message, raw_ref=raw_ref)
-
-    if get_session_mode(user_id) == SESSION_MODE_RECEIPT:
-        return handle_receipt_user_message(user_id, message)
+def handle_general_chat(user_id: str, message: str, mode_hint: str | None = None) -> ChatResponse:
+    if needs_human_transfer(message):
+        answer = "这个我不瞎承诺，我帮您转人工处理。"
+        if mode_hint:
+            answer = append_mode_hint(answer, mode_hint)
+        return ChatResponse(user_id=user_id, answer=answer, history_length=0)
 
     with MEMORY_LOCK:
         memory = load_memory()
@@ -2566,7 +2785,10 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
 
         logger.info("chat_request user_id=%s history_length=%s", user_id, len(history))
 
-        answer = call_llm(user_id, history)
+        answer = call_llm(user_id, history).strip()
+        if mode_hint:
+            answer = append_mode_hint(answer, mode_hint)
+
         history.append(
             {
                 "role": "assistant",
@@ -2584,6 +2806,104 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         answer=answer,
         history_length=len(history),
     )
+
+
+def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) -> ChatResponse:
+    user_id = user_id.strip()
+    message = message.strip()
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id cannot be empty")
+    if not message:
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    command = normalize_command(message)
+    inline_order_message = strip_order_inline_prefix(message)
+    current_mode = get_session_mode(user_id)
+
+    if command in ORDER_EXPORT_COMMANDS:
+        return ChatResponse(
+            user_id=user_id,
+            answer=build_order_export_message(),
+            history_length=user_order_count(user_id),
+        )
+
+    if is_status_command(command):
+        return ChatResponse(
+            user_id=user_id,
+            answer=build_status_message(user_id),
+            history_length=user_order_count(user_id),
+        )
+
+    if command in ORDER_MODE_COMMANDS:
+        set_session_mode(user_id, SESSION_MODE_ORDER)
+        return ChatResponse(
+            user_id=user_id,
+            answer="好的，进入订单模式了，直接发订单文字、Excel 或照片都行，发“退出”就退出。",
+            history_length=user_order_count(user_id),
+        )
+
+    if command in RECEIPT_MODE_COMMANDS:
+        set_session_mode(user_id, SESSION_MODE_RECEIPT)
+        return ChatResponse(
+            user_id=user_id,
+            answer="好的，进入入库模式了，发产成品入库照片就行，发“退出”就退出。",
+            history_length=0,
+        )
+
+    if is_exit_mode_command(command) or command in INTERVIEW_MODE_COMMANDS:
+        return ChatResponse(
+            user_id=user_id,
+            answer=exit_business_mode(user_id),
+            history_length=0,
+        )
+
+    if command in ORDER_CANCEL_COMMANDS:
+        if current_mode == SESSION_MODE_RECEIPT:
+            clear_receipt_draft(user_id)
+            answer = "已清空当前入库草稿，入库模式还在。"
+        elif current_mode == SESSION_MODE_ORDER:
+            clear_order_draft(user_id)
+            answer = "已清空当前订单草稿，订单模式还在。"
+        else:
+            record = get_session_record(user_id)
+            record.pop("order_draft", None)
+            record.pop("receipt_draft", None)
+            save_session_record(user_id, record)
+            answer = "已清空当前草稿。"
+        return ChatResponse(user_id=user_id, answer=answer, history_length=0)
+
+    if is_revoke_command(command):
+        if current_mode == SESSION_MODE_RECEIPT:
+            answer = cancel_latest_receipt_for_user(user_id)
+        else:
+            answer = cancel_latest_order_for_user(user_id)
+        return ChatResponse(user_id=user_id, answer=answer, history_length=user_order_count(user_id))
+
+    if command in ORDER_CONFIRM_COMMANDS:
+        if current_mode == SESSION_MODE_ORDER:
+            return handle_order_user_message(user_id, message, raw_ref=raw_ref)
+        if current_mode == SESSION_MODE_RECEIPT:
+            return handle_receipt_user_message(user_id, message)
+        return ChatResponse(
+            user_id=user_id,
+            answer="现在没有待确认的业务草稿。要录订单发“订单”，要记入库发“入库”。",
+            history_length=0,
+        )
+
+    if inline_order_message is not None:
+        set_session_mode(user_id, SESSION_MODE_ORDER)
+        return handle_order_user_message(user_id, inline_order_message, raw_ref=raw_ref)
+
+    if current_mode == SESSION_MODE_ORDER:
+        if looks_like_order_message(message):
+            return handle_order_user_message(user_id, message, raw_ref=raw_ref)
+        return handle_general_chat(user_id, message, mode_hint=SESSION_MODE_ORDER)
+
+    if current_mode == SESSION_MODE_RECEIPT:
+        return handle_general_chat(user_id, message, mode_hint=SESSION_MODE_RECEIPT)
+
+    return handle_general_chat(user_id, message)
 
 
 def get_wecom_crypto() -> WXBizMsgCrypt:
