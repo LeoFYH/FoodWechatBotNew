@@ -1960,7 +1960,7 @@ def llm_parse_photo_order(image_bytes: bytes, mime_type: str | None, raw_ref: st
 只输出一个 JSON 对象，不要解释，不要 Markdown。
 
 格式：
-{
+{{
   "kind":"base",
   "source":"photo",
   "store":"门店/区域",
@@ -1969,13 +1969,13 @@ def llm_parse_photo_order(image_bytes: bytes, mime_type: str | None, raw_ref: st
   "order_date":"YYYY-MM-DD 或原文，可空",
   "deliver_date":"YYYY-MM-DD 或原文，可空",
   "items":[
-    {"code":"商品编码或#N/A或空","name":"商品名称","spec":"规格","unit":"单位","qty":2,"price":267.32,"category":"分类"}
+    {{"code":"商品编码或#N/A或空","name":"商品名称","spec":"规格","unit":"单位","qty":2,"price":267.32,"category":"分类"}}
   ],
   "confirmed":false,
   "status":"new",
   "raw_ref":"",
   "created_at":""
-}
+}}
 
 要求：
 - 今天日期：{today}，当前年份：{current_year}。
