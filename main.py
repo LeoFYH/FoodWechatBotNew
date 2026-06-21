@@ -13,7 +13,7 @@ import struct
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from threading import Lock
@@ -38,7 +38,7 @@ DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL_NAME = "qwen3-vl-plus"
 DEFAULT_MAX_HISTORY_MESSAGES = 20
 DEFAULT_SYSTEM_PROMPT = "你是运行在微信里的公司客服助手。说话自然、简洁，像真人客服；客户闲聊可以接一两句，但不要把客服窗口变成闲聊室。涉及价格、交期、投诉、纠纷、退款、发票等事项，不要瞎承诺，明确转人工处理。"
-CUSTOMER_CHAT_PROMPT = "你是运行在微信里的公司客服。普通聊天要自然、简短，像真人客服。不要进入需求访谈，不要问客户工作流程、审批、排班、数据整理、痛点、频率，也不要说自己只有需求访谈模式。客户问订单/入库怎么用时，只给简短操作提示。涉及价格、交期、投诉、纠纷、退款、发票等事项，不要承诺，回复转人工处理。"
+CUSTOMER_CHAT_PROMPT = "你是运行在微信里的公司客服。普通聊天要自然、简短，像真人客服。不要进入需求访谈，不要问客户工作流程、审批、排班、数据整理、痛点、频率，也不要说自己只有需求访谈模式。客户问订单/入库怎么用时，只给简短操作提示。涉及价格、交期、投诉、纠纷、退款、发票等事项，不要承诺，回复转人工处理。不要声称自己正在入库、同步、查询数据库、生成单号或保存成功；这些业务动作只能由程序命令层完成。"
 DEFAULT_WECOM_BOT_NAME = "食品厂机器人"
 DEFAULT_WECOM_KF_SYNC_LIMIT = 100
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
@@ -901,6 +901,8 @@ MODE_HELP_COMMANDS = {"模式", "有哪些模式", "有什么模式", "你有哪
 REVOKE_COMMANDS = {"撤回", "撤回上一单", "删了上一单", "删了", "刚那个不对", "刚才那个不对", "上一单不对"}
 ORDER_EXPORT_COMMANDS = {"导出订单", "订单导出", "下载订单", "订单表", "导出订单表"}
 ORDER_CONFIRM_COMMANDS = {"确认", "确认订单", "保存", "保存订单", "提交", "提交订单"}
+CONFIRM_LIKE_KEYWORDS = {"确认", "确认无误", "没问题", "可以", "对的", "是的", "保存", "提交", "录入", "写库", "入数据库", "直接入库", "记下"}
+ORDER_STORAGE_QUERY_KEYWORDS = {"入库结果", "同步结果", "订单库", "数据库", "拉订单库", "同步订单", "查订单", "查一下订单", "看一下入库"}
 ORDER_CANCEL_COMMANDS = {"取消", "取消订单", "取消草稿", "清空", "清空订单", "清空草稿", "不要了"}
 
 ORDER_KIND_BASE = "base"
@@ -1113,10 +1115,38 @@ def is_status_command(command: str) -> bool:
     return command in STATUS_COMMANDS
 
 
+def is_order_mode_command(command: str) -> bool:
+    if command in ORDER_MODE_COMMANDS:
+        return True
+    if "订单" in command and command_contains_any(command, {"我要", "要", "发", "传", "录", "下", "表", "图片", "照片", "模式"}):
+        return True
+    return False
+
+
+def is_receipt_mode_command(command: str) -> bool:
+    if command in RECEIPT_MODE_COMMANDS:
+        return True
+    if "入库" in command and command_contains_any(command, {"我要", "要", "发", "传", "照片", "图片", "模式", "产成品", "成品"}):
+        return True
+    return False
+
+
 def is_mode_help_command(command: str) -> bool:
     if command in MODE_HELP_COMMANDS:
         return True
     return "模式" in command and command_contains_any(command, {"哪些", "什么", "有啥", "怎么", "功能"})
+
+
+def is_confirm_command(command: str) -> bool:
+    if command in ORDER_CONFIRM_COMMANDS:
+        return True
+    if command_contains_any(command, {"取消", "撤回", "不对", "不是", "别", "不要"}):
+        return False
+    return command_contains_any(command, CONFIRM_LIKE_KEYWORDS)
+
+
+def is_order_storage_query_command(command: str) -> bool:
+    return command_contains_any(command, ORDER_STORAGE_QUERY_KEYWORDS)
 
 
 def mode_display_name(mode: str) -> str:
@@ -1174,6 +1204,16 @@ def build_mode_help_message(user_id: str) -> str:
         "2. 订单模式：发“订单”进入，支持订单文字、Excel、照片；确认后写订单库。\n"
         "3. 入库模式：发“入库”进入，发产成品照片；确认后写入库库。\n"
         "常用命令：退出、取消、状态、撤回。"
+    )
+
+
+def build_order_storage_query_reply(user_id: str) -> str:
+    draft = get_order_draft(user_id)
+    if order_draft_has_content(draft):
+        return "现在还有一张订单草稿没入库。确认没问题请回“确认入库”；要改就直接发修改内容。"
+    return (
+        "我这里不编入库结果。订单只有在你回复“确认入库”后才会写进 orders.db。\n"
+        "Web 工具同步时按订单的 order_date 拉取；如果工具是空，先确认刚才那单是否已经保存，以及工具选的下单日期是否和订单里的 order_date 一致。"
     )
 
 
@@ -1432,6 +1472,48 @@ def fallback_order_date(created_at: str) -> str:
     return datetime.now().date().isoformat()
 
 
+def parse_iso_date(value: Any) -> date | None:
+    text = normalize_order_date_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def repair_photo_order_dates(data: dict[str, Any]) -> dict[str, Any]:
+    if clean_order_value(data.get("source")) != ORDER_SOURCE_PHOTO:
+        return data
+
+    order_dt = parse_iso_date(data.get("order_date"))
+    if order_dt is None:
+        return data
+
+    repaired = dict(data)
+    current_year = datetime.now().year
+    deliver_dt = parse_iso_date(data.get("deliver_date"))
+    target_year = deliver_dt.year if deliver_dt else current_year
+
+    if order_dt.year == target_year:
+        return repaired
+
+    candidate: date | None = None
+    try:
+        candidate = order_dt.replace(year=target_year)
+    except ValueError:
+        candidate = None
+
+    if candidate and deliver_dt and abs((deliver_dt - candidate).days) <= 14:
+        repaired["order_date"] = candidate.isoformat()
+        return repaired
+
+    if candidate and not deliver_dt and abs(order_dt.year - current_year) > 1:
+        repaired["order_date"] = candidate.isoformat()
+
+    return repaired
+
+
 def normalize_deliver_date_text(value: Any) -> str:
     text = normalize_date_text(value)
     if not text:
@@ -1494,6 +1576,7 @@ def normalize_order_items(data: dict[str, Any], kind: str) -> list[dict[str, Any
 
 
 def normalize_order_payload(data: dict[str, Any]) -> dict[str, Any]:
+    data = repair_photo_order_dates(data)
     source = clean_order_value(data.get("source"))
     kind = clean_order_value(data.get("kind"))
     if kind not in ORDER_KINDS:
@@ -1869,7 +1952,9 @@ def call_vision_json(prompt: str, image_bytes: bytes, mime_type: str | None) -> 
 
 
 def llm_parse_photo_order(image_bytes: bytes, mime_type: str | None, raw_ref: str) -> dict[str, Any]:
-    prompt = """
+    today = datetime.now().date().isoformat()
+    current_year = datetime.now().year
+    prompt = f"""
 你是馄饨侯订单照片识别助手。请读取图片中的订单表格或手写订单，输出 Web 工具可直接使用的基础订单 JSON。
 
 只输出一个 JSON 对象，不要解释，不要 Markdown。
@@ -1893,6 +1978,9 @@ def llm_parse_photo_order(image_bytes: bytes, mime_type: str | None, raw_ref: st
 }
 
 要求：
+- 今天日期：{today}，当前年份：{current_year}。
+- order_date 是订单标题/表头里的下单日期或归属日期，例如“6.16下午订单”“6.16订”必须按当前年份输出为“{current_year}-06-16”。
+- 表格中的送货/配送/到货日期只放 deliver_date，不要拿它替代 order_date。
 - qty 和 price 尽量输出数字，识别不到用 null。
 - code、spec、category 识别不到用空字符串。
 - deliver_date 只填客户要求送达/到货日期；created_at 不要填送达日期。
@@ -2624,7 +2712,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
             history_length=history_length,
         )
 
-    if command in ORDER_CONFIRM_COMMANDS:
+    if is_confirm_command(command):
         draft = get_order_draft(user_id)
         if not order_draft_has_content(draft):
             return ChatResponse(
@@ -2729,7 +2817,7 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
             history_length=0,
         )
 
-    if command in ORDER_CONFIRM_COMMANDS:
+    if is_confirm_command(command):
         draft = get_receipt_draft(user_id)
         if not receipt_draft_has_content(draft):
             return ChatResponse(
@@ -2888,7 +2976,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             history_length=user_order_count(user_id),
         )
 
-    if command in ORDER_MODE_COMMANDS:
+    if is_order_mode_command(command):
         set_session_mode(user_id, SESSION_MODE_ORDER)
         return ChatResponse(
             user_id=user_id,
@@ -2896,7 +2984,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             history_length=user_order_count(user_id),
         )
 
-    if command in RECEIPT_MODE_COMMANDS:
+    if is_receipt_mode_command(command):
         set_session_mode(user_id, SESSION_MODE_RECEIPT)
         return ChatResponse(
             user_id=user_id,
@@ -2933,7 +3021,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             answer = cancel_latest_order_for_user(user_id)
         return ChatResponse(user_id=user_id, answer=answer, history_length=user_order_count(user_id))
 
-    if command in ORDER_CONFIRM_COMMANDS:
+    if is_confirm_command(command):
         if current_mode == SESSION_MODE_ORDER:
             return handle_order_user_message(user_id, message, raw_ref=raw_ref)
         if current_mode == SESSION_MODE_RECEIPT:
@@ -2942,6 +3030,13 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             user_id=user_id,
             answer="现在没有待确认的业务草稿。要录订单发“订单”，要记入库发“入库”。",
             history_length=0,
+        )
+
+    if current_mode == SESSION_MODE_ORDER and is_order_storage_query_command(command):
+        return ChatResponse(
+            user_id=user_id,
+            answer=build_order_storage_query_reply(user_id),
+            history_length=user_order_count(user_id),
         )
 
     if inline_order_message is not None:
