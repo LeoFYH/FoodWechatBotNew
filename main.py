@@ -38,6 +38,7 @@ DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL_NAME = "qwen3-vl-plus"
 DEFAULT_MAX_HISTORY_MESSAGES = 20
 DEFAULT_SYSTEM_PROMPT = "你是运行在微信里的公司客服助手。说话自然、简洁，像真人客服；客户闲聊可以接一两句，但不要把客服窗口变成闲聊室。涉及价格、交期、投诉、纠纷、退款、发票等事项，不要瞎承诺，明确转人工处理。"
+CUSTOMER_CHAT_PROMPT = "你是运行在微信里的公司客服。普通聊天要自然、简短，像真人客服。不要进入需求访谈，不要问客户工作流程、审批、排班、数据整理、痛点、频率，也不要说自己只有需求访谈模式。客户问订单/入库怎么用时，只给简短操作提示。涉及价格、交期、投诉、纠纷、退款、发票等事项，不要承诺，回复转人工处理。"
 DEFAULT_WECOM_BOT_NAME = "食品厂机器人"
 DEFAULT_WECOM_KF_SYNC_LIMIT = 100
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
@@ -896,6 +897,7 @@ RECEIPT_MODE_COMMANDS = {"入库", "入库模式", "产成品入库", "开始入
 INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "访谈模式", "普通模式", "聊天"}
 EXIT_MODE_COMMANDS = {"退出", "结束", "不弄了", "算了", "返回", "退出订单", "退出入库", "结束订单", "结束入库"}
 STATUS_COMMANDS = {"状态", "我在哪", "我在哪儿", "当前状态", "现在状态", "现在是什么模式"}
+MODE_HELP_COMMANDS = {"模式", "有哪些模式", "有什么模式", "你有哪些模式", "你有什么模式", "怎么用", "你会什么", "功能", "帮助"}
 REVOKE_COMMANDS = {"撤回", "撤回上一单", "删了上一单", "删了", "刚那个不对", "刚才那个不对", "上一单不对"}
 ORDER_EXPORT_COMMANDS = {"导出订单", "订单导出", "下载订单", "订单表", "导出订单表"}
 ORDER_CONFIRM_COMMANDS = {"确认", "确认订单", "保存", "保存订单", "提交", "提交订单"}
@@ -1111,6 +1113,12 @@ def is_status_command(command: str) -> bool:
     return command in STATUS_COMMANDS
 
 
+def is_mode_help_command(command: str) -> bool:
+    if command in MODE_HELP_COMMANDS:
+        return True
+    return "模式" in command and command_contains_any(command, {"哪些", "什么", "有啥", "怎么", "功能"})
+
+
 def mode_display_name(mode: str) -> str:
     if mode == SESSION_MODE_ORDER:
         return "订单模式"
@@ -1155,6 +1163,18 @@ def build_status_message(user_id: str) -> str:
     if isinstance(record.get("receipt_draft"), dict):
         draft_text = "有一份入库草稿待确认"
     return f"你现在在{mode_display_name(mode)}，{draft_text}。"
+
+
+def build_mode_help_message(user_id: str) -> str:
+    current = mode_display_name(get_session_mode(user_id))
+    return (
+        f"我现在在{current}。\n"
+        "可用模式：\n"
+        "1. 普通聊天：正常问事、闲聊两句都可以。\n"
+        "2. 订单模式：发“订单”进入，支持订单文字、Excel、照片；确认后写订单库。\n"
+        "3. 入库模式：发“入库”进入，发产成品照片；确认后写入库库。\n"
+        "常用命令：退出、取消、状态、撤回。"
+    )
 
 
 ORDER_LIKE_KEYWORDS = {
@@ -2567,6 +2587,31 @@ def call_llm(user_id: str, history: list[dict[str, str]]) -> str:
     return answer or ""
 
 
+def call_customer_chat_llm(user_id: str, history: list[dict[str, str]]) -> str:
+    messages = [{"role": "system", "content": CUSTOMER_CHAT_PROMPT}, *history]
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+        )
+    except Exception as exc:
+        logger.exception(
+            "customer_chat_llm_error user_id=%s model=%s error_type=%s",
+            user_id,
+            MODEL_NAME,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "LLM request failed",
+                "real_error": str(exc),
+            },
+        ) from exc
+
+    return (response.choices[0].message.content or "").strip()
+
+
 def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = None) -> ChatResponse:
     command = normalize_command(message)
     history_length = user_order_count(user_id)
@@ -2764,9 +2809,10 @@ def handle_general_chat(user_id: str, message: str, mode_hint: str | None = None
             answer = append_mode_hint(answer, mode_hint)
         return ChatResponse(user_id=user_id, answer=answer, history_length=0)
 
+    memory_key = f"customer_chat:{user_id}"
     with MEMORY_LOCK:
         memory = load_memory()
-        history = memory.setdefault(user_id, [])
+        history = memory.setdefault(memory_key, [])
 
         if not isinstance(history, list):
             raise HTTPException(status_code=500, detail=f"Invalid history for user_id: {user_id}")
@@ -2781,11 +2827,11 @@ def handle_general_chat(user_id: str, message: str, mode_hint: str | None = None
             }
         )
         history = trim_history(history)
-        memory[user_id] = history
+        memory[memory_key] = history
 
-        logger.info("chat_request user_id=%s history_length=%s", user_id, len(history))
+        logger.info("customer_chat_request user_id=%s history_length=%s", user_id, len(history))
 
-        answer = call_llm(user_id, history).strip()
+        answer = call_customer_chat_llm(user_id, history).strip()
         if mode_hint:
             answer = append_mode_hint(answer, mode_hint)
 
@@ -2798,7 +2844,7 @@ def handle_general_chat(user_id: str, message: str, mode_hint: str | None = None
             }
         )
         history = trim_history(history)
-        memory[user_id] = history
+        memory[memory_key] = history
         save_memory(memory)
 
     return ChatResponse(
@@ -2832,6 +2878,13 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         return ChatResponse(
             user_id=user_id,
             answer=build_status_message(user_id),
+            history_length=user_order_count(user_id),
+        )
+
+    if is_mode_help_command(command):
+        return ChatResponse(
+            user_id=user_id,
+            answer=build_mode_help_message(user_id),
             history_length=user_order_count(user_id),
         )
 
