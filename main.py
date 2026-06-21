@@ -4,24 +4,27 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import re
 import socket
+import sqlite3
 import struct
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from Crypto.Cipher import AES
 import httpx
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openai import OpenAI
@@ -42,7 +45,10 @@ DEFAULT_EXPORT_DIR = "exports"
 DEFAULT_INTERVIEW_IDLE_ARCHIVE_SECONDS = 300
 DEFAULT_INTERVIEW_ARCHIVE_POLL_SECONDS = 60
 DEFAULT_SESSION_STATE_FILE = "session_state.json"
-DEFAULT_ORDER_FILE = "orders.json"
+DEFAULT_ORDER_DB_FILE = "orders.db"
+DEFAULT_RECEIPT_DB_FILE = "receipts.db"
+DEFAULT_VISION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_VISION_MODEL = "qwen3-vl-plus"
 
 
 def get_int_env(name: str, default: int) -> int:
@@ -98,7 +104,12 @@ SYSTEM_PROMPT = load_system_prompt()
 PROMPT_TURN_CONTEXT = get_bool_env("PROMPT_TURN_CONTEXT", bool(PROMPT_FILE))
 MEMORY_FILE = Path(os.getenv("MEMORY_FILE", "memory.json"))
 SESSION_STATE_FILE = Path(os.getenv("SESSION_STATE_FILE", DEFAULT_SESSION_STATE_FILE))
-ORDER_FILE = Path(os.getenv("ORDER_FILE", DEFAULT_ORDER_FILE))
+ORDER_DB_FILE = Path(os.getenv("ORDER_DB_FILE", DEFAULT_ORDER_DB_FILE))
+RECEIPT_DB_FILE = Path(os.getenv("RECEIPT_DB_FILE", DEFAULT_RECEIPT_DB_FILE))
+VISION_API_KEY = os.getenv("VISION_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
+VISION_BASE_URL = os.getenv("VISION_BASE_URL", DEFAULT_VISION_BASE_URL)
+VISION_MODEL = os.getenv("VISION_MODEL", DEFAULT_VISION_MODEL)
+ROBOT_API_TOKEN = os.getenv("ROBOT_API_TOKEN", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 MEMORY_LOCK = Lock()
 WECOM_CALLBACK_TOKEN = os.getenv("WECOM_CALLBACK_TOKEN") or os.getenv("WX_BOT_TOKEN")
@@ -132,6 +143,8 @@ WECOM_KF_ACCESS_TOKEN_LOCK = Lock()
 INTERVIEW_ARCHIVE_LOCK = Lock()
 SESSION_STATE_LOCK = Lock()
 ORDER_LOCK = Lock()
+ORDER_DB_LOCK = Lock()
+RECEIPT_DB_LOCK = Lock()
 WECOM_KF_ACCESS_TOKEN = ""
 WECOM_KF_ACCESS_TOKEN_EXPIRES_AT = 0.0
 
@@ -142,6 +155,10 @@ client = OpenAI(
     api_key=LLM_API_KEY,
     base_url=LLM_BASE_URL,
 )
+vision_client = OpenAI(
+    api_key=VISION_API_KEY,
+    base_url=VISION_BASE_URL,
+) if VISION_API_KEY else None
 
 
 class ChatRequest(BaseModel):
@@ -188,6 +205,17 @@ class WecomKfApiError(RuntimeError):
         self.data = data
         self.errcode = data.get("errcode")
         super().__init__(f"WeCom API {path} failed: {data}")
+
+
+class MarkFetchedRequest(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+
+
+class TextOrderImportRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    message: str = Field(..., min_length=1)
+    confirm: bool = False
+    raw_ref: str | None = None
 
 
 def load_memory() -> dict:
@@ -250,30 +278,360 @@ def save_session_state(state: dict[str, dict[str, Any]]) -> None:
     )
 
 
-def load_orders() -> list[dict[str, Any]]:
-    if not ORDER_FILE.exists():
-        return []
+def init_order_db() -> None:
+    ORDER_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(ORDER_DB_FILE) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                store TEXT NOT NULL DEFAULT '',
+                order_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'new',
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                raw_ref TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(order_entries)").fetchall()
+        }
+        if "order_date" not in columns:
+            conn.execute("ALTER TABLE order_entries ADD COLUMN order_date TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_status ON order_entries(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_confirmed ON order_entries(confirmed)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_kind ON order_entries(kind)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_order_date ON order_entries(order_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_status_order_date ON order_entries(status, order_date)")
+        rows = conn.execute(
+            "SELECT id, payload_json, created_at FROM order_entries WHERE order_date = ''"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row[1]))
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            order_date = normalize_order_date_text(payload.get("order_date")) if isinstance(payload, dict) else ""
+            if order_date:
+                conn.execute(
+                    "UPDATE order_entries SET order_date = ? WHERE id = ?",
+                    (str(order_date), int(row[0])),
+                )
+        conn.commit()
 
-    raw_orders = ORDER_FILE.read_text(encoding="utf-8").strip()
-    if not raw_orders:
-        return []
 
+def order_db_connection() -> sqlite3.Connection:
+    init_order_db()
+    conn = sqlite3.connect(ORDER_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def row_to_order_payload(row: sqlite3.Row) -> dict[str, Any]:
     try:
-        data = json.loads(raw_orders)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail="orders.json is not valid JSON") from exc
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
 
-    if not isinstance(data, list):
-        raise HTTPException(status_code=500, detail="orders.json must contain a JSON array")
+    payload["id"] = int(row["id"])
+    payload["kind"] = str(row["kind"])
+    payload["source"] = str(row["source"])
+    payload["store"] = str(row["store"] or payload.get("store") or "")
+    payload["confirmed"] = bool(row["confirmed"])
+    payload["status"] = str(row["status"])
+    payload["raw_ref"] = str(row["raw_ref"] or payload.get("raw_ref") or "")
+    payload["created_at"] = str(row["created_at"] or payload.get("created_at") or "")
+    payload["order_date"] = str(row["order_date"] or payload.get("order_date") or "")
+    normalized = normalize_order_payload(payload)
+    normalized["id"] = int(row["id"])
+    normalized["kind"] = str(row["kind"])
+    normalized["source"] = str(row["source"])
+    normalized["store"] = str(row["store"] or normalized.get("store") or "")
+    normalized["confirmed"] = bool(row["confirmed"])
+    normalized["status"] = str(row["status"])
+    normalized["raw_ref"] = str(row["raw_ref"] or normalized.get("raw_ref") or "")
+    normalized["created_at"] = str(row["created_at"] or normalized.get("created_at") or "")
+    normalized["order_date"] = str(row["order_date"] or normalized.get("order_date") or "")
+    return normalized
 
-    return [record for record in data if isinstance(record, dict)]
+
+def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_order_payload(payload)
+    if normalized.get("confirmed"):
+        missing = order_draft_missing_fields(normalized)
+        if missing:
+            raise ValueError("confirmed order missing fields: " + ",".join(missing))
+
+    created_at = normalized.get("created_at") or now_iso()
+    normalized["created_at"] = created_at
+    normalized["order_date"] = str(normalized.get("order_date") or "")
+    normalized["status"] = normalized.get("status") or "new"
+    normalized["confirmed"] = bool(normalized.get("confirmed"))
+
+    with ORDER_DB_LOCK:
+        with order_db_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO order_entries (
+                    kind, source, store, order_date, status, confirmed, raw_ref,
+                    created_at, updated_at, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(normalized.get("kind") or ""),
+                    str(normalized.get("source") or ""),
+                    str(normalized.get("store") or ""),
+                    str(normalized.get("order_date") or ""),
+                    str(normalized.get("status") or "new"),
+                    1 if normalized.get("confirmed") else 0,
+                    str(normalized.get("raw_ref") or ""),
+                    created_at,
+                    now_iso(),
+                    json.dumps(normalized, ensure_ascii=False),
+                ),
+            )
+            order_id = int(cursor.lastrowid)
+            normalized["id"] = order_id
+            conn.execute(
+                "UPDATE order_entries SET payload_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(normalized, ensure_ascii=False), now_iso(), order_id),
+            )
+            conn.commit()
+    return normalized
 
 
-def save_orders(orders: list[dict[str, Any]]) -> None:
-    ORDER_FILE.write_text(
-        json.dumps(orders, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def query_order_payloads(
+    status: str | None = None,
+    ids: list[int] | None = None,
+    order_date: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses = ["confirmed = 1"]
+    params: list[Any] = []
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        clauses.append(f"id IN ({placeholders})")
+        params.extend(ids)
+    else:
+        if order_date is not None:
+            clauses.append("order_date = ?")
+            params.append(order_date)
+    if status and status != ORDER_STATUS_ALL and not ids:
+        clauses.append("status = ?")
+        params.append(status)
+
+    where_sql = " AND ".join(clauses)
+    with order_db_connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM order_entries WHERE {where_sql} ORDER BY id ASC",
+            params,
+        ).fetchall()
+    return [row_to_order_payload(row) for row in rows]
+
+
+def mark_order_payloads_fetched(ids: list[int]) -> dict[str, list[int]]:
+    clean_ids = sorted({int(order_id) for order_id in ids if int(order_id) > 0})
+    if not clean_ids:
+        return {"succeeded": [], "failed": []}
+
+    placeholders = ",".join("?" for _ in clean_ids)
+    with ORDER_DB_LOCK:
+        with order_db_connection() as conn:
+            existing_rows = conn.execute(
+                f"SELECT id FROM order_entries WHERE id IN ({placeholders})",
+                clean_ids,
+            ).fetchall()
+            existing_ids = {int(row["id"]) for row in existing_rows}
+            succeeded = [order_id for order_id in clean_ids if order_id in existing_ids]
+            failed = [order_id for order_id in clean_ids if order_id not in existing_ids]
+
+            if not succeeded:
+                return {"succeeded": [], "failed": failed}
+
+            update_placeholders = ",".join("?" for _ in succeeded)
+            conn.execute(
+                f"""
+                UPDATE order_entries
+                SET status = 'fetched',
+                    updated_at = ?
+                WHERE id IN ({update_placeholders})
+                """,
+                [now_iso(), *succeeded],
+            )
+            rows = conn.execute(
+                f"SELECT * FROM order_entries WHERE id IN ({update_placeholders})",
+                succeeded,
+            ).fetchall()
+            for row in rows:
+                payload = row_to_order_payload(row)
+                payload["status"] = "fetched"
+                conn.execute(
+                    "UPDATE order_entries SET payload_json = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), int(row["id"])),
+                )
+            conn.commit()
+            return {"succeeded": succeeded, "failed": failed}
+
+
+def init_receipt_db() -> None:
+    RECEIPT_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(RECEIPT_DB_FILE) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS receipt_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_entries_date ON receipt_entries(date)")
+        conn.commit()
+
+
+def receipt_db_connection() -> sqlite3.Connection:
+    init_receipt_db()
+    conn = sqlite3.connect(RECEIPT_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def normalize_receipt_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "code": optional_text(item.get("code"), null_for_empty=True),
+        "name": optional_text(item.get("name")) or "",
+        "spec": optional_text(item.get("spec"), null_for_empty=True),
+        "unit": optional_text(item.get("unit"), null_for_empty=True),
+        "qty": normalize_number(item.get("qty")),
+    }
+    return normalized
+
+
+def normalize_receipt_payload(data: dict[str, Any]) -> dict[str, Any]:
+    created_at = clean_order_value(data.get("created_at")) or now_iso()
+    date = normalize_order_date_text(data.get("date")) or fallback_order_date(created_at)
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    normalized_items = [
+        normalize_receipt_item(item)
+        for item in items
+        if isinstance(item, dict)
+    ]
+    normalized_items = [
+        item
+        for item in normalized_items
+        if item.get("name") or item.get("qty") is not None
+    ]
+
+    payload: dict[str, Any] = {
+        "date": date,
+        "items": normalized_items,
+        "created_at": created_at,
+    }
+    if data.get("id") not in (None, ""):
+        payload["id"] = str(data.get("id"))
+    if data.get("raw_ref"):
+        payload["raw_ref"] = clean_order_value(data.get("raw_ref"))
+    return payload
+
+
+def receipt_missing_fields(payload: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not payload.get("date"):
+        missing.append("入库日期")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        missing.append("成品和数量")
+        return missing
+
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            missing.append(f"第{index}项成品")
+            continue
+        if not item.get("name"):
+            missing.append(f"第{index}项成品名称")
+        if item.get("qty") is None:
+            missing.append(f"第{index}项数量")
+    return missing
+
+
+def row_to_receipt_payload(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["date"] = str(row["date"] or payload.get("date") or "")
+    normalized = normalize_receipt_payload(payload)
+    normalized["id"] = f"r{int(row['id']):03d}"
+    normalized["date"] = str(row["date"] or normalized.get("date") or "")
+    return {
+        "id": normalized["id"],
+        "date": normalized["date"],
+        "items": normalized.get("items") or [],
+    }
+
+
+def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_receipt_payload(payload)
+    missing = receipt_missing_fields(normalized)
+    if missing:
+        raise ValueError("receipt missing fields: " + ",".join(missing))
+
+    with RECEIPT_DB_LOCK:
+        with receipt_db_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO receipt_entries (
+                    date, created_at, updated_at, payload_json
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    str(normalized.get("date") or ""),
+                    str(normalized.get("created_at") or now_iso()),
+                    now_iso(),
+                    json.dumps(normalized, ensure_ascii=False),
+                ),
+            )
+            receipt_id = int(cursor.lastrowid)
+            normalized["id"] = f"r{receipt_id:03d}"
+            conn.execute(
+                "UPDATE receipt_entries SET payload_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(normalized, ensure_ascii=False), now_iso(), receipt_id),
+            )
+            conn.commit()
+    return {
+        "id": str(normalized["id"]),
+        "date": str(normalized.get("date") or ""),
+        "items": normalized.get("items") or [],
+    }
+
+
+def query_receipt_payloads(date: str) -> list[dict[str, Any]]:
+    with receipt_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM receipt_entries WHERE date = ? ORDER BY id ASC",
+            (date,),
+        ).fetchall()
+    return [row_to_receipt_payload(row) for row in rows]
 
 
 def load_interview_archive() -> dict[str, dict[str, Any]]:
@@ -380,58 +738,134 @@ ARCHIVE_EVENT_TYPES = {"close_session", "session_close", "archive_session"}
 
 SESSION_MODE_INTERVIEW = "interview"
 SESSION_MODE_ORDER = "order"
-SESSION_MODES = {SESSION_MODE_INTERVIEW, SESSION_MODE_ORDER}
+SESSION_MODE_RECEIPT = "receipt"
+SESSION_MODES = {SESSION_MODE_INTERVIEW, SESSION_MODE_ORDER, SESSION_MODE_RECEIPT}
 
 ORDER_MODE_COMMANDS = {"订单", "录单", "下单", "订单模式", "开始订单", "开始录单"}
-INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "访谈模式", "结束订单", "退出订单"}
+RECEIPT_MODE_COMMANDS = {"入库", "入库模式", "产成品入库", "开始入库", "成品入库"}
+INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "访谈模式", "结束订单", "退出订单", "结束入库", "退出入库"}
 ORDER_EXPORT_COMMANDS = {"导出订单", "订单导出", "下载订单", "订单表", "导出订单表"}
 ORDER_CONFIRM_COMMANDS = {"确认", "确认订单", "保存", "保存订单", "提交", "提交订单"}
 ORDER_CANCEL_COMMANDS = {"取消", "取消订单", "清空", "清空订单"}
 
-ORDER_TOP_LEVEL_FIELDS = [
-    "customer",
-    "delivery_date",
-    "delivery_address",
-    "contact",
-    "phone",
-    "notes",
+ORDER_KIND_BASE = "base"
+ORDER_KIND_PATCH = "patch"
+ORDER_SOURCE_EXCEL = "excel"
+ORDER_SOURCE_PHOTO = "photo"
+ORDER_SOURCE_TEXT = "text"
+ORDER_STATUS_NEW = "new"
+ORDER_STATUS_FETCHED = "fetched"
+ORDER_STATUS_ALL = "all"
+ORDER_CHANGE_ADD = "add"
+ORDER_CHANGE_MODIFY = "modify"
+ORDER_KINDS = {ORDER_KIND_BASE, ORDER_KIND_PATCH}
+ORDER_SOURCES = {ORDER_SOURCE_EXCEL, ORDER_SOURCE_PHOTO, ORDER_SOURCE_TEXT}
+ORDER_STATUSES = {ORDER_STATUS_NEW, ORDER_STATUS_FETCHED, ORDER_STATUS_ALL}
+ORDER_CHANGE_TYPES = {ORDER_CHANGE_ADD, ORDER_CHANGE_MODIFY}
+
+BASE_ORDER_FIELDS = [
+    "id",
+    "kind",
+    "source",
+    "store",
+    "order_no",
+    "orderer",
+    "order_date",
+    "deliver_date",
+    "items",
+    "confirmed",
+    "status",
+    "raw_ref",
+    "created_at",
 ]
-ORDER_ITEM_FIELDS = [
-    "product",
-    "specification",
-    "quantity",
+PATCH_ORDER_FIELDS = [
+    "id",
+    "kind",
+    "source",
+    "store",
+    "items",
+    "change_type",
+    "order_date",
+    "deliver_date",
+    "confirmed",
+    "status",
+    "raw_text",
+    "raw_ref",
+    "created_at",
+]
+BASE_ITEM_FIELDS = [
+    "code",
+    "name",
+    "spec",
     "unit",
-    "unit_price",
-    "amount",
-    "notes",
+    "qty",
+    "price",
+    "category",
 ]
-ORDER_EXPORT_HEADERS = [
-    "订单ID",
-    "行号",
-    "创建时间",
-    "提交人",
-    "客户",
-    "商品",
-    "规格",
-    "数量",
-    "单位",
-    "单价",
-    "金额",
-    "交付日期",
-    "交付地址",
-    "联系人",
-    "电话",
-    "备注",
-    "原始消息",
+PATCH_ITEM_FIELDS = [
+    "code",
+    "name",
+    "spec",
+    "unit",
+    "qty",
 ]
+
 ORDER_SUMMARY_HEADERS = [
-    "客户",
+    "门店/区域",
     "商品",
     "单位",
     "数量合计",
     "订单行数",
     "最近创建时间",
 ]
+
+ORDER_CONTRACT_EXPORT_HEADERS = [
+    "ID",
+    "类型",
+    "来源",
+    "状态",
+    "已确认",
+    "门店/区域",
+    "订单号",
+    "下单人",
+    "下单日期",
+    "送达日期",
+    "变更类型",
+    "行号",
+    "商品编码",
+    "商品名称",
+    "规格",
+    "单位",
+    "数量",
+    "单价",
+    "分类",
+    "原始文本",
+    "原始引用",
+    "创建时间",
+]
+
+EXCEL_HEADER_ALIASES = {
+    "store": {"门店", "门店/区域", "区域", "店铺", "店名", "客户", "客户名称", "收货方", "门店名称"},
+    "order_no": {"订单号", "单号", "订单编号", "编号"},
+    "orderer": {"下单人", "订货人", "订货员", "制单人", "联系人"},
+    "order_date": {"下单日期", "订单日期", "日期", "制单日期"},
+    "deliver_date": {"送达日期", "送货日期", "配送日期", "交付日期", "到货日期"},
+    "code": {"商品编码", "编码", "货号", "商品代码", "code", "物料编码"},
+    "name": {"商品名称", "品名", "名称", "商品", "name", "物料名称"},
+    "spec": {"规格", "规格型号", "型号", "包装规格", "spec"},
+    "unit": {"单位", "unit"},
+    "qty": {"数量", "订货数量", "下单数量", "箱数", "件数", "qty"},
+    "price": {"单价", "价格", "price"},
+    "category": {"分类", "类别", "品类", "category"},
+}
+
+EXCEL_METADATA_LABELS = {
+    "store": {"门店", "门店/区域", "区域", "店铺", "客户", "收货方"},
+    "order_no": {"订单号", "单号", "订单编号"},
+    "orderer": {"下单人", "订货人", "联系人"},
+    "order_date": {"下单日期", "订单日期"},
+    "deliver_date": {"送达日期", "送货日期", "配送日期", "到货日期"},
+}
 
 
 def clean_export_value(value: str) -> str:
@@ -576,6 +1010,27 @@ def clear_order_draft(user_id: str) -> None:
     save_session_record(user_id, record)
 
 
+def get_receipt_draft(user_id: str) -> dict[str, Any]:
+    draft = get_session_record(user_id).get("receipt_draft")
+    if isinstance(draft, dict):
+        return normalize_receipt_payload(draft)
+    return {}
+
+
+def save_receipt_draft(user_id: str, draft: dict[str, Any]) -> None:
+    record = get_session_record(user_id)
+    record["mode"] = SESSION_MODE_RECEIPT
+    record["receipt_draft"] = normalize_receipt_payload(draft)
+    save_session_record(user_id, record)
+
+
+def clear_receipt_draft(user_id: str) -> None:
+    record = get_session_record(user_id)
+    record["mode"] = SESSION_MODE_RECEIPT
+    record.pop("receipt_draft", None)
+    save_session_record(user_id, record)
+
+
 def clean_order_value(value: Any) -> str:
     if value is None:
         return ""
@@ -584,49 +1039,241 @@ def clean_order_value(value: Any) -> str:
     return clean_export_value(str(value))
 
 
-def normalize_order_item(item: dict[str, Any]) -> dict[str, str]:
-    return {field: clean_order_value(item.get(field)) for field in ORDER_ITEM_FIELDS}
+def optional_text(value: Any, *, null_for_empty: bool = False) -> str | None:
+    cleaned = clean_order_value(value)
+    if cleaned:
+        return cleaned
+    if null_for_empty:
+        return None
+    return ""
+
+
+def normalize_number(value: Any) -> int | float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not match:
+        return None
+    number = float(match.group(0))
+    return int(number) if number.is_integer() else number
+
+
+def normalize_date_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    return clean_order_value(value)
+
+
+def make_iso_date(year: int, month: int, day: int) -> str:
+    return datetime(year, month, day).date().isoformat()
+
+
+def normalize_order_date_text(value: Any) -> str:
+    text = normalize_date_text(value)
+    if not text:
+        return ""
+
+    year = datetime.now().year
+    full_match = re.search(
+        r"(?<!\d)(20\d{2})[.\-/年](\d{1,2})[.\-/月](\d{1,2})(?:日)?",
+        text,
+    )
+    if full_match:
+        try:
+            return make_iso_date(
+                int(full_match.group(1)),
+                int(full_match.group(2)),
+                int(full_match.group(3)),
+            )
+        except ValueError:
+            return text
+
+    short_match = re.search(
+        r"(?<!\d)(\d{1,2})[.\-/月](\d{1,2})(?:日)?",
+        text,
+    )
+    if short_match:
+        try:
+            return make_iso_date(year, int(short_match.group(1)), int(short_match.group(2)))
+        except ValueError:
+            return text
+
+    return text
+
+
+def extract_explicit_order_date(text: str) -> str:
+    if not text:
+        return ""
+
+    patterns = [
+        r"(?<!\d)(20\d{2})[.\-/年](\d{1,2})[.\-/月](\d{1,2})(?:日)?\s*(?:订|下单|订单)",
+        r"(?<!\d)(\d{1,2})[.\-/月](\d{1,2})(?:日)?\s*(?:订|下单|订单)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            if len(match.groups()) == 3:
+                return make_iso_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            return make_iso_date(datetime.now().year, int(match.group(1)), int(match.group(2)))
+        except ValueError:
+            return ""
+    return ""
+
+
+def fallback_order_date(created_at: str) -> str:
+    if created_at:
+        try:
+            return datetime.fromisoformat(created_at).date().isoformat()
+        except ValueError:
+            pass
+    return datetime.now().date().isoformat()
+
+
+def normalize_deliver_date_text(value: Any) -> str:
+    text = normalize_date_text(value)
+    if not text:
+        return ""
+
+    today = datetime.now().date()
+    if "后天" in text:
+        return (today + timedelta(days=2)).isoformat()
+    if any(word in text for word in ("明天", "明日", "明早", "明晚", "明晨")):
+        return (today + timedelta(days=1)).isoformat()
+    if any(word in text for word in ("今天", "今日", "今晚", "今早")):
+        return today.isoformat()
+    return text
+
+
+def generate_contract_order_no(store: str, order_date: str) -> str:
+    date_part = order_date or datetime.now().strftime("%Y-%m-%d")
+    store_part = store or "未确认门店"
+    raw = f"{store_part}-{date_part}"
+    return re.sub(r"\s+", "", raw)
+
+
+def normalize_base_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "code": optional_text(item.get("code")),
+        "name": optional_text(item.get("name")),
+        "spec": optional_text(item.get("spec")),
+        "unit": optional_text(item.get("unit")),
+        "qty": normalize_number(item.get("qty")),
+        "price": normalize_number(item.get("price")),
+        "category": optional_text(item.get("category")),
+    }
+    return normalized
+
+
+def normalize_patch_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "code": optional_text(item.get("code"), null_for_empty=True),
+        "name": optional_text(item.get("name")),
+        "spec": optional_text(item.get("spec"), null_for_empty=True),
+        "unit": optional_text(item.get("unit"), null_for_empty=True),
+        "qty": normalize_number(item.get("qty")),
+    }
+    return normalized
+
+
+def normalize_order_items(data: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    normalized_items: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized = normalize_patch_item(item) if kind == ORDER_KIND_PATCH else normalize_base_item(item)
+        if normalized.get("name") or normalized.get("code") or normalized.get("qty") is not None:
+            normalized_items.append(normalized)
+    return normalized_items
+
+
+def normalize_order_payload(data: dict[str, Any]) -> dict[str, Any]:
+    source = clean_order_value(data.get("source"))
+    kind = clean_order_value(data.get("kind"))
+    if kind not in ORDER_KINDS:
+        kind = ORDER_KIND_PATCH if source == ORDER_SOURCE_TEXT else ORDER_KIND_BASE
+    if source not in ORDER_SOURCES:
+        source = ORDER_SOURCE_TEXT if kind == ORDER_KIND_PATCH else ORDER_SOURCE_EXCEL
+
+    status = clean_order_value(data.get("status")) or ORDER_STATUS_NEW
+    if status not in ORDER_STATUSES:
+        status = ORDER_STATUS_NEW
+
+    created_at = clean_order_value(data.get("created_at")) or now_iso()
+    store = optional_text(data.get("store")) or ("未确认门店" if source == ORDER_SOURCE_EXCEL else "")
+    normalized: dict[str, Any] = {
+        "kind": kind,
+        "source": source,
+        "store": store,
+        "items": normalize_order_items(data, kind),
+        "confirmed": bool(data.get("confirmed")),
+        "status": status,
+        "raw_ref": optional_text(data.get("raw_ref")) or "",
+        "created_at": created_at,
+    }
+
+    if data.get("id") not in (None, ""):
+        try:
+            normalized["id"] = int(data["id"])
+        except (TypeError, ValueError):
+            pass
+
+    if kind == ORDER_KIND_BASE:
+        order_date = normalize_order_date_text(data.get("order_date")) or fallback_order_date(created_at)
+        deliver_date = normalize_deliver_date_text(data.get("deliver_date"))
+        normalized["order_no"] = optional_text(data.get("order_no")) or generate_contract_order_no(
+            store,
+            order_date,
+        )
+        normalized["orderer"] = optional_text(data.get("orderer")) or ""
+        normalized["order_date"] = order_date
+        normalized["deliver_date"] = deliver_date
+        return {field: normalized.get(field) for field in BASE_ORDER_FIELDS if field in normalized}
+
+    change_type = clean_order_value(data.get("change_type")) or ORDER_CHANGE_ADD
+    if change_type not in ORDER_CHANGE_TYPES:
+        change_type = ORDER_CHANGE_MODIFY if "改" in str(data.get("raw_text") or "") else ORDER_CHANGE_ADD
+    normalized["change_type"] = change_type
+    explicit_order_date = extract_explicit_order_date(str(data.get("raw_text") or ""))
+    normalized["order_date"] = normalize_order_date_text(data.get("order_date")) or explicit_order_date or fallback_order_date(created_at)
+    normalized["deliver_date"] = normalize_deliver_date_text(data.get("deliver_date"))
+    normalized["raw_text"] = optional_text(data.get("raw_text")) or ""
+    return {field: normalized.get(field) for field in PATCH_ORDER_FIELDS if field in normalized}
 
 
 def normalize_order_draft(data: dict[str, Any]) -> dict[str, Any]:
-    draft: dict[str, Any] = {
-        field: clean_order_value(data.get(field))
-        for field in ORDER_TOP_LEVEL_FIELDS
-    }
-
-    items = data.get("items")
-    if not isinstance(items, list):
-        if any(data.get(field) for field in ORDER_ITEM_FIELDS):
-            items = [data]
-        else:
-            items = []
-
-    normalized_items = [
-        normalize_order_item(item)
-        for item in items
-        if isinstance(item, dict)
-    ]
-    draft["items"] = [
-        item
-        for item in normalized_items
-        if any(item.get(field) for field in ORDER_ITEM_FIELDS)
-    ]
-
-    raw_messages = data.get("raw_messages")
-    if isinstance(raw_messages, list):
-        draft["raw_messages"] = [clean_order_value(message) for message in raw_messages if clean_order_value(message)]
-    elif data.get("raw_message"):
-        draft["raw_messages"] = [clean_order_value(data.get("raw_message"))]
-    else:
-        draft["raw_messages"] = []
-
-    return draft
+    if not data:
+        return {}
+    return normalize_order_payload(data)
 
 
 def order_draft_missing_fields(draft: dict[str, Any]) -> list[str]:
+    if not draft:
+        return ["订单内容"]
+
     missing: list[str] = []
-    if not draft.get("customer"):
-        missing.append("客户")
+    kind = draft.get("kind")
+    if not draft.get("store"):
+        missing.append("门店/区域")
+    if kind == ORDER_KIND_PATCH and not draft.get("change_type"):
+        missing.append("变更类型")
 
     items = draft.get("items")
     if not isinstance(items, list) or not items:
@@ -637,31 +1284,41 @@ def order_draft_missing_fields(draft: dict[str, Any]) -> list[str]:
         if not isinstance(item, dict):
             missing.append(f"第{index}项商品")
             continue
-        if not item.get("product"):
-            missing.append(f"第{index}项商品")
-        if not item.get("quantity"):
+        if not item.get("name"):
+            missing.append(f"第{index}项商品名称")
+        if item.get("qty") is None:
             missing.append(f"第{index}项数量")
 
     return missing
 
 
 def format_order_draft_summary(draft: dict[str, Any]) -> str:
+    if not draft:
+        return "暂无订单草稿"
+
+    kind_label = "基础订单" if draft.get("kind") == ORDER_KIND_BASE else "文字补丁"
+    source_label = {"excel": "Excel", "photo": "照片", "text": "文字"}.get(str(draft.get("source")), str(draft.get("source") or ""))
     lines = [
-        f"客户：{draft.get('customer') or '未填写'}",
+        f"类型：{kind_label}",
+        f"来源：{source_label}",
+        f"门店/区域：{draft.get('store') or '未填写'}",
     ]
 
-    delivery_date = draft.get("delivery_date")
-    if delivery_date:
-        lines.append(f"交付日期：{delivery_date}")
-
-    delivery_address = draft.get("delivery_address")
-    if delivery_address:
-        lines.append(f"交付地址：{delivery_address}")
-
-    contact = draft.get("contact")
-    phone = draft.get("phone")
-    if contact or phone:
-        lines.append(f"联系人：{contact or '未填写'} {phone or ''}".strip())
+    if draft.get("kind") == ORDER_KIND_BASE:
+        lines.append(f"订单号：{draft.get('order_no') or '自动生成'}")
+        if draft.get("orderer"):
+            lines.append(f"下单人：{draft.get('orderer')}")
+        if draft.get("order_date"):
+            lines.append(f"下单日期：{draft.get('order_date')}")
+        if draft.get("deliver_date"):
+            lines.append(f"送达日期：{draft.get('deliver_date')}")
+    else:
+        change_label = "加货" if draft.get("change_type") == ORDER_CHANGE_ADD else "改量"
+        lines.append(f"变更类型：{change_label}")
+        if draft.get("order_date"):
+            lines.append(f"下单日期：{draft.get('order_date')}")
+        if draft.get("deliver_date"):
+            lines.append(f"送达备注：{draft.get('deliver_date')}")
 
     items = draft.get("items") if isinstance(draft.get("items"), list) else []
     if not items:
@@ -672,50 +1329,67 @@ def format_order_draft_summary(draft: dict[str, Any]) -> str:
             if not isinstance(item, dict):
                 continue
             parts = [
-                item.get("product") or "未填写商品",
-                item.get("specification") or "",
-                f"{item.get('quantity') or '未填写数量'}{item.get('unit') or ''}",
+                str(item.get("code") or "").strip(),
+                str(item.get("name") or "未填写商品").strip(),
+                str(item.get("spec") or "").strip(),
+                f"{item.get('qty') if item.get('qty') is not None else '未填写数量'}{item.get('unit') or ''}",
             ]
-            price = item.get("unit_price")
-            amount = item.get("amount")
-            if price:
-                parts.append(f"单价{price}")
-            if amount:
-                parts.append(f"金额{amount}")
-            item_notes = item.get("notes")
-            if item_notes:
-                parts.append(item_notes)
+            if item.get("price") is not None:
+                parts.append(f"单价{item.get('price')}")
+            if item.get("category"):
+                parts.append(str(item.get("category")))
             lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
-
-    notes = draft.get("notes")
-    if notes:
-        lines.append(f"备注：{notes}")
 
     return "\n".join(lines)
 
 
 def llm_parse_order_draft(existing_draft: dict[str, Any], message: str) -> dict[str, Any]:
+    existing_kind = existing_draft.get("kind") if isinstance(existing_draft, dict) else ""
+    if existing_kind == ORDER_KIND_BASE:
+        schema_hint = """
+输出基础订单 JSON：
+{
+  "kind":"base","source":"photo","store":"","order_no":"","orderer":"",
+  "order_date":"","deliver_date":"",
+  "items":[{"code":"","name":"","spec":"","unit":"","qty":0,"price":null,"category":""}],
+  "confirmed":false,"status":"new","raw_ref":"","created_at":""
+}
+""".strip()
+        task_hint = "已有草稿是照片/Excel基础订单。新消息通常是在纠错或补充字段，请合并到已有基础订单里。"
+    else:
+        schema_hint = """
+输出文字补丁 JSON：
+{
+  "kind":"patch","source":"text","store":"",
+  "items":[{"code":null,"name":"","spec":null,"unit":"","qty":0}],
+  "change_type":"add","order_date":"","deliver_date":"",
+  "confirmed":false,"status":"new","raw_text":"","raw_ref":"","created_at":""
+}
+""".strip()
+        task_hint = "新消息是群里文字加货/改量。只负责问清门店、商品、数量，不要挂靠到具体订单。"
+
+    today = datetime.now().date().isoformat()
     prompt = f"""
-你是食品、餐饮供应链的订单录入助手。请把员工发来的微信订单整理成 JSON 草稿。
+你是馄饨侯订单机器人。请按接口契约把微信消息整理成 Web 工具可直接使用的 JSON。
 
-只输出一个 JSON 对象，不要输出解释，不要使用 Markdown。
+只输出一个 JSON 对象，不要解释，不要 Markdown。
 
-JSON 字段：
-- customer：客户/门店/收货方名称
-- delivery_date：交付/配送日期或时间，保留原文
-- delivery_address：交付地址
-- contact：联系人
-- phone：电话
-- notes：整单备注
-- items：数组，每个元素包含 product, specification, quantity, unit, unit_price, amount, notes
+{task_hint}
 
-规则：
-- 结合“已有草稿”和“新消息”做合并；新消息是补充或修改时，用新消息覆盖对应字段。
-- 多个商品必须拆成多个 items。
-- 数量、单位、单价、金额都保留用户原文，不要自己换算。
-- 信息没出现就留空字符串，不要编造。
-- 如果用户说“再加”“加上”，通常是在已有 items 基础上新增商品。
-- 如果文本像“老三家要鸡腿20件”，customer 是“老三家”，product 是“鸡腿”，quantity 是“20”，unit 是“件”。
+今天日期：{today}
+
+字段要求：
+- base 用于标准 Excel 或照片订单；patch 用于文字加货/改量。
+- store 是门店/区域，必须尽量从原文提取。
+- order_date 是下单日期/归属日期，是 Web 工具归批字段。文字里出现“6.21订”“6月21日订”“2026-6-21下单”时，必须填 order_date=YYYY-MM-DD。
+- qty、price 输出数字；缺失用 null。
+- code 可能为空或 "#N/A"，照实保留。
+- 文本里出现“加、追加、再来、补”通常 change_type=add；出现“改、换成、数量改为”通常 change_type=modify。
+- deliver_date 只是可选送达备注。文字里出现送达/到货时间时可以填；不要用 deliver_date 替代 order_date。
+- created_at 表示消息收到时间，不要从用户文本推断，不要填送达时间。
+- 信息没出现不要编造，留空字符串或 null。
+
+{schema_hint}
 
 已有草稿：
 {json.dumps(existing_draft, ensure_ascii=False)}
@@ -733,64 +1407,279 @@ JSON 字段：
         temperature=0,
     )
     raw = response.choices[0].message.content or ""
-    return normalize_order_draft(extract_json_object(raw))
+    parsed = extract_json_object(raw)
+    if parsed.get("kind") == ORDER_KIND_PATCH:
+        parsed["raw_text"] = parsed.get("raw_text") or message
+    explicit_order_date = extract_explicit_order_date(message)
+    if explicit_order_date:
+        parsed["order_date"] = explicit_order_date
+    parsed["created_at"] = existing_draft.get("created_at") if isinstance(existing_draft, dict) else ""
+    parsed["created_at"] = parsed["created_at"] or now_iso()
+    return normalize_order_draft(parsed)
 
 
-def generate_order_id(user_id: str) -> str:
-    digest = hashlib.sha1(f"{user_id}:{time.time()}".encode("utf-8")).hexdigest()[:6].upper()
-    return f"OD{datetime.now().strftime('%Y%m%d%H%M%S')}-{digest}"
+def normalize_excel_header(value: Any) -> str:
+    text = clean_order_value(value).lower()
+    return re.sub(r"[\s:_：/\\（）()\[\]【】\-]+", "", text)
 
 
-def build_order_records_from_draft(user_id: str, draft: dict[str, Any]) -> list[dict[str, str]]:
-    order_id = generate_order_id(user_id)
-    created_at = now_iso()
-    raw_message = "\n".join(str(message) for message in draft.get("raw_messages", []) if message)
-    records: list[dict[str, str]] = []
+def excel_header_key(value: Any) -> str | None:
+    normalized = normalize_excel_header(value)
+    if not normalized:
+        return None
+    for key, aliases in EXCEL_HEADER_ALIASES.items():
+        for alias in aliases:
+            if normalized == normalize_excel_header(alias):
+                return key
+    return None
 
-    for line_no, item in enumerate(draft.get("items", []), start=1):
-        if not isinstance(item, dict):
+
+def find_excel_header_row(rows: list[tuple[Any, ...]]) -> tuple[int, dict[int, str]]:
+    best_index = -1
+    best_map: dict[int, str] = {}
+    best_score = 0
+    for index, row in enumerate(rows[:30]):
+        header_map: dict[int, str] = {}
+        for column_index, value in enumerate(row):
+            key = excel_header_key(value)
+            if key and key not in header_map.values():
+                header_map[column_index] = key
+        score = len(header_map)
+        if score > best_score:
+            best_index = index
+            best_map = header_map
+            best_score = score
+
+    if best_score < 2 or "name" not in best_map.values() or "qty" not in best_map.values():
+        raise ValueError("Excel header row not found; expected product name and quantity columns")
+    return best_index, best_map
+
+
+def extract_excel_metadata(rows: list[tuple[Any, ...]], header_index: int) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for row in rows[: max(header_index, 1)]:
+        cells = list(row)
+        for index, value in enumerate(cells):
+            text = clean_order_value(value)
+            if not text:
+                continue
+            for field, labels in EXCEL_METADATA_LABELS.items():
+                if metadata.get(field):
+                    continue
+                for label in labels:
+                    label_text = normalize_excel_header(label)
+                    value_text = normalize_excel_header(text)
+                    if value_text == label_text and index + 1 < len(cells):
+                        metadata[field] = cells[index + 1]
+                    elif value_text.startswith(label_text) and len(text) > len(label):
+                        metadata[field] = re.sub(rf"^{re.escape(label)}\s*[：: ]*", "", text).strip()
+    return metadata
+
+
+def row_value_by_header(row: tuple[Any, ...], header_map: dict[int, str], field: str) -> Any:
+    for index, key in header_map.items():
+        if key == field and index < len(row):
+            return row[index]
+    return None
+
+
+def parse_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str, Any]]:
+    workbook = load_workbook(BytesIO(file_bytes), data_only=True)
+    sheet = workbook.active
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("Excel file is empty")
+
+    header_index, header_map = find_excel_header_row(rows)
+    metadata = extract_excel_metadata(rows, header_index)
+    grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+
+    for row in rows[header_index + 1 :]:
+        item = {
+            "code": row_value_by_header(row, header_map, "code"),
+            "name": row_value_by_header(row, header_map, "name"),
+            "spec": row_value_by_header(row, header_map, "spec"),
+            "unit": row_value_by_header(row, header_map, "unit"),
+            "qty": row_value_by_header(row, header_map, "qty"),
+            "price": row_value_by_header(row, header_map, "price"),
+            "category": row_value_by_header(row, header_map, "category"),
+        }
+        normalized_item = normalize_base_item(item)
+        if not normalized_item.get("name") and normalized_item.get("qty") is None:
             continue
-        records.append(
-            {
-                "order_id": order_id,
-                "line_no": str(line_no),
-                "created_at": created_at,
-                "submitted_by": user_id,
-                "customer": str(draft.get("customer") or ""),
-                "product": str(item.get("product") or ""),
-                "specification": str(item.get("specification") or ""),
-                "quantity": str(item.get("quantity") or ""),
-                "unit": str(item.get("unit") or ""),
-                "unit_price": str(item.get("unit_price") or ""),
-                "amount": str(item.get("amount") or ""),
-                "delivery_date": str(draft.get("delivery_date") or ""),
-                "delivery_address": str(draft.get("delivery_address") or ""),
-                "contact": str(draft.get("contact") or ""),
-                "phone": str(draft.get("phone") or ""),
-                "notes": str(draft.get("notes") or item.get("notes") or ""),
-                "raw_message": raw_message,
-            }
+
+        store = row_value_by_header(row, header_map, "store") or metadata.get("store") or ""
+        order_no = row_value_by_header(row, header_map, "order_no") or metadata.get("order_no") or ""
+        orderer = row_value_by_header(row, header_map, "orderer") or metadata.get("orderer") or ""
+        order_date = row_value_by_header(row, header_map, "order_date") or metadata.get("order_date") or ""
+        deliver_date = row_value_by_header(row, header_map, "deliver_date") or metadata.get("deliver_date") or ""
+
+        key = (
+            clean_order_value(store),
+            clean_order_value(order_no),
+            clean_order_value(orderer),
+            normalize_order_date_text(order_date),
+            normalize_date_text(deliver_date),
         )
+        payload = grouped.setdefault(
+            key,
+            {
+                "kind": ORDER_KIND_BASE,
+                "source": ORDER_SOURCE_EXCEL,
+                "store": store,
+                "order_no": order_no,
+                "orderer": orderer,
+                "order_date": order_date,
+                "deliver_date": deliver_date,
+                "items": [],
+                "confirmed": True,
+                "status": ORDER_STATUS_NEW,
+                "raw_ref": raw_ref,
+                "created_at": now_iso(),
+            },
+        )
+        payload["items"].append(normalized_item)
 
-    return records
+    payloads = [normalize_order_payload(payload) for payload in grouped.values()]
+    if not payloads:
+        raise ValueError("Excel file contains no order item rows")
+    return payloads
 
 
-def save_confirmed_order(user_id: str, draft: dict[str, Any]) -> tuple[str, int]:
-    records = build_order_records_from_draft(user_id, draft)
-    if not records:
-        raise ValueError("order draft has no items")
+def image_data_uri(image_bytes: bytes, mime_type: str | None) -> str:
+    mime = mime_type or "image/jpeg"
+    if not mime.startswith("image/"):
+        mime = "image/jpeg"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
-    with ORDER_LOCK:
-        orders = load_orders()
-        orders.extend(records)
-        save_orders(orders)
 
-    return records[0]["order_id"], len(records)
+def ensure_vision_recognition_ready() -> None:
+    if vision_client is None:
+        raise RuntimeError("vision model is not configured")
+
+
+def call_vision_json(prompt: str, image_bytes: bytes, mime_type: str | None) -> dict[str, Any]:
+    ensure_vision_recognition_ready()
+    response = vision_client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=[
+            {"role": "system", "content": "你只输出可解析 JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_uri(image_bytes, mime_type)}},
+                ],
+            },
+        ],
+        temperature=0,
+    )
+    raw = response.choices[0].message.content or ""
+    return extract_json_object(raw)
+
+
+def llm_parse_photo_order(image_bytes: bytes, mime_type: str | None, raw_ref: str) -> dict[str, Any]:
+    prompt = """
+你是馄饨侯订单照片识别助手。请读取图片中的订单表格或手写订单，输出 Web 工具可直接使用的基础订单 JSON。
+
+只输出一个 JSON 对象，不要解释，不要 Markdown。
+
+格式：
+{
+  "kind":"base",
+  "source":"photo",
+  "store":"门店/区域",
+  "order_no":"有则填，没有留空",
+  "orderer":"可空",
+  "order_date":"YYYY-MM-DD 或原文，可空",
+  "deliver_date":"YYYY-MM-DD 或原文，可空",
+  "items":[
+    {"code":"商品编码或#N/A或空","name":"商品名称","spec":"规格","unit":"单位","qty":2,"price":267.32,"category":"分类"}
+  ],
+  "confirmed":false,
+  "status":"new",
+  "raw_ref":"",
+  "created_at":""
+}
+
+要求：
+- qty 和 price 尽量输出数字，识别不到用 null。
+- code、spec、category 识别不到用空字符串。
+- deliver_date 只填客户要求送达/到货日期；created_at 不要填送达日期。
+- 不要编造图片里没有的信息。
+- 多个商品拆成多个 items。
+""".strip()
+
+    parsed = call_vision_json(prompt, image_bytes, mime_type)
+    parsed["kind"] = ORDER_KIND_BASE
+    parsed["source"] = ORDER_SOURCE_PHOTO
+    parsed["confirmed"] = False
+    parsed["status"] = ORDER_STATUS_NEW
+    parsed["raw_ref"] = raw_ref
+    parsed["created_at"] = now_iso()
+    return normalize_order_payload(parsed)
+
+
+def llm_parse_receipt_photo(image_bytes: bytes, mime_type: str | None, raw_ref: str) -> dict[str, Any]:
+    today = datetime.now().date().isoformat()
+    prompt = f"""
+你是产成品入库照片识别助手。请读取车间发来的产成品入库照片，只识别成品名称和数量清单。
+
+只输出一个 JSON 对象，不要解释，不要 Markdown。
+
+格式：
+{{
+  "date": "YYYY-MM-DD",
+  "items": [
+    {{"code": null, "name": "鸡汤虾肉馄饨", "spec": null, "unit": "箱", "qty": 50}}
+  ]
+}}
+
+规则：
+- 今天日期：{today}
+- date 是车间入库日期。图片里有日期就按图片日期；没有日期就填今天。
+- 不要输出 store，入库是车间总量，不分门店。
+- items[].qty 必须是数字，不要带“箱/袋/件”等单位字。
+- 单位放到 unit；识别不到单位填 null。
+- code/spec 可选，识别不到填 null。
+- 不要编造图片里没有的成品。
+""".strip()
+    parsed = call_vision_json(prompt, image_bytes, mime_type)
+    parsed["raw_ref"] = raw_ref
+    parsed["created_at"] = now_iso()
+    return normalize_receipt_payload(parsed)
+
+
+def save_confirmed_order(user_id: str, draft: dict[str, Any]) -> tuple[int, int]:
+    payload = normalize_order_payload(draft)
+    missing = order_draft_missing_fields(payload)
+    if missing:
+        raise ValueError("order draft missing fields: " + ",".join(missing))
+
+    payload["confirmed"] = True
+    payload["status"] = ORDER_STATUS_NEW
+    payload["raw_ref"] = payload.get("raw_ref") or user_id
+    saved = insert_order_payload(payload)
+    return int(saved["id"]), len(saved.get("items") or [])
+
+
+def save_confirmed_receipt(draft: dict[str, Any]) -> tuple[str, int]:
+    payload = normalize_receipt_payload(draft)
+    missing = receipt_missing_fields(payload)
+    if missing:
+        raise ValueError("receipt draft missing fields: " + ",".join(missing))
+    saved = insert_receipt_payload(payload)
+    return str(saved["id"]), len(saved.get("items") or [])
 
 
 def user_order_count(user_id: str) -> int:
-    with ORDER_LOCK:
-        return sum(1 for record in load_orders() if str(record.get("submitted_by")) == user_id)
+    raw_ref_prefixes = (user_id, f"{user_id}:")
+    return sum(
+        1
+        for record in query_order_payloads()
+        if str(record.get("raw_ref") or "").startswith(raw_ref_prefixes)
+    )
 
 
 def normalize_interview_record(record: dict[str, Any]) -> dict[str, str]:
@@ -1169,53 +2058,69 @@ def build_interview_export() -> Path:
 
 
 def collect_order_records() -> list[dict[str, str]]:
-    with ORDER_LOCK:
-        records = load_orders()
+    records = query_order_payloads()
 
     normalized_records: list[dict[str, str]] = []
-    export_fields = [
-        "order_id",
-        "line_no",
-        "created_at",
-        "submitted_by",
-        "customer",
-        "product",
-        "specification",
-        "quantity",
-        "unit",
-        "unit_price",
-        "amount",
-        "delivery_date",
-        "delivery_address",
-        "contact",
-        "phone",
-        "notes",
-        "raw_message",
-    ]
     for record in records:
-        normalized_records.append({field: str(record.get(field) or "") for field in export_fields})
+        items = record.get("items") if isinstance(record.get("items"), list) else []
+        if not items:
+            items = [{}]
+        for line_no, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                item = {}
+            normalized_records.append(
+                {
+                    "id": str(record.get("id") or ""),
+                    "kind": str(record.get("kind") or ""),
+                    "source": str(record.get("source") or ""),
+                    "status": str(record.get("status") or ""),
+                    "confirmed": "是" if record.get("confirmed") else "否",
+                    "store": str(record.get("store") or ""),
+                    "order_no": str(record.get("order_no") or ""),
+                    "orderer": str(record.get("orderer") or ""),
+                    "order_date": str(record.get("order_date") or ""),
+                    "deliver_date": str(record.get("deliver_date") or ""),
+                    "change_type": str(record.get("change_type") or ""),
+                    "line_no": str(line_no),
+                    "code": str(item.get("code") or ""),
+                    "name": str(item.get("name") or ""),
+                    "spec": str(item.get("spec") or ""),
+                    "unit": str(item.get("unit") or ""),
+                    "qty": "" if item.get("qty") is None else str(item.get("qty")),
+                    "price": "" if item.get("price") is None else str(item.get("price")),
+                    "category": str(item.get("category") or ""),
+                    "raw_text": str(record.get("raw_text") or ""),
+                    "raw_ref": str(record.get("raw_ref") or ""),
+                    "created_at": str(record.get("created_at") or ""),
+                }
+            )
     return normalized_records
 
 
 def order_record_to_export_row(record: dict[str, str]) -> list[str]:
     return [
-        record["order_id"],
+        record["id"],
+        record["kind"],
+        record["source"],
+        record["status"],
+        record["confirmed"],
+        record["store"],
+        record["order_no"],
+        record["orderer"],
+        record["order_date"],
+        record["deliver_date"],
+        record["change_type"],
         record["line_no"],
-        record["created_at"],
-        record["submitted_by"],
-        record["customer"],
-        record["product"],
-        record["specification"],
-        record["quantity"],
+        record["code"],
+        record["name"],
+        record["spec"],
         record["unit"],
-        record["unit_price"],
-        record["amount"],
-        record["delivery_date"],
-        record["delivery_address"],
-        record["contact"],
-        record["phone"],
-        record["notes"],
-        record["raw_message"],
+        record["qty"],
+        record["price"],
+        record["category"],
+        record["raw_text"],
+        record["raw_ref"],
+        record["created_at"],
     ]
 
 
@@ -1238,7 +2143,7 @@ def format_quantity_total(value: float) -> str:
 def build_order_summary_rows(records: list[dict[str, str]]) -> list[list[str]]:
     groups: dict[tuple[str, str, str], dict[str, Any]] = {}
     for record in records:
-        key = (record["customer"], record["product"], record["unit"])
+        key = (record["store"], record["name"], record["unit"])
         group = groups.setdefault(
             key,
             {
@@ -1250,7 +2155,7 @@ def build_order_summary_rows(records: list[dict[str, str]]) -> list[list[str]]:
             },
         )
         group["count"] += 1
-        quantity = record["quantity"]
+        quantity = record["qty"]
         number = parse_quantity_number(quantity)
         if number is None:
             if quantity:
@@ -1262,7 +2167,7 @@ def build_order_summary_rows(records: list[dict[str, str]]) -> list[list[str]]:
             group["latest_created_at"] = record["created_at"]
 
     rows: list[list[str]] = []
-    for (customer, product, unit), group in sorted(groups.items()):
+    for (store, product, unit), group in sorted(groups.items()):
         quantity_parts: list[str] = []
         if group["numeric_count"]:
             quantity_parts.append(format_quantity_total(float(group["total"])))
@@ -1270,7 +2175,7 @@ def build_order_summary_rows(records: list[dict[str, str]]) -> list[list[str]]:
             quantity_parts.append("、".join(group["raw_quantities"]))
         rows.append(
             [
-                customer,
+                store,
                 product,
                 unit,
                 "；".join(quantity_parts),
@@ -1313,12 +2218,12 @@ def build_order_export() -> Path:
     detail_rows = [order_record_to_export_row(record) for record in records]
     write_order_table_sheet(
         detail_sheet,
-        ORDER_EXPORT_HEADERS,
+        ORDER_CONTRACT_EXPORT_HEADERS,
         detail_rows,
-        [18, 8, 20, 28, 22, 24, 18, 12, 10, 12, 12, 18, 30, 16, 16, 30, 60],
+        [10, 10, 10, 10, 10, 22, 18, 14, 14, 14, 12, 8, 16, 28, 20, 10, 12, 12, 14, 36, 44, 20],
     )
 
-    summary_sheet = workbook.create_sheet("按客户商品汇总")
+    summary_sheet = workbook.create_sheet("按门店商品汇总")
     write_order_table_sheet(
         summary_sheet,
         ORDER_SUMMARY_HEADERS,
@@ -1393,7 +2298,7 @@ def call_llm(user_id: str, history: list[dict[str, str]]) -> str:
     return answer or ""
 
 
-def handle_order_user_message(user_id: str, message: str) -> ChatResponse:
+def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = None) -> ChatResponse:
     command = normalize_command(message)
     history_length = user_order_count(user_id)
 
@@ -1434,7 +2339,7 @@ def handle_order_user_message(user_id: str, message: str) -> ChatResponse:
         clear_order_draft(user_id)
         return ChatResponse(
             user_id=user_id,
-            answer=f"已保存订单 {order_id}，共 {line_count} 行商品。继续发下一张订单即可。",
+            answer=f"已保存订单入库，ID {order_id}，共 {line_count} 行商品。继续发下一张即可。",
             history_length=history_length + line_count,
         )
 
@@ -1445,13 +2350,16 @@ def handle_order_user_message(user_id: str, message: str) -> ChatResponse:
         logger.warning("order_parse_failed user_id=%s error=%s", user_id, exc)
         return ChatResponse(
             user_id=user_id,
-            answer="这条订单我没有解析成功。请按“客户 + 商品 + 数量”的格式重发，例如：老三家 鸡腿 20件，明早送。",
+            answer="这条订单我没有解析成功。请按“门店 + 商品 + 数量”的格式重发，例如：老三家 鸡腿 20件。",
             history_length=history_length,
         )
 
-    raw_messages = list(existing_draft.get("raw_messages", []))
-    raw_messages.append(message)
-    draft["raw_messages"] = raw_messages[-20:]
+    draft["raw_ref"] = draft.get("raw_ref") or raw_ref or user_id
+    if draft.get("kind") == ORDER_KIND_PATCH:
+        draft["raw_text"] = draft.get("raw_text") or message
+    draft["confirmed"] = False
+    draft["status"] = ORDER_STATUS_NEW
+    draft["created_at"] = draft.get("created_at") or now_iso()
     draft = normalize_order_draft(draft)
     save_order_draft(user_id, draft)
 
@@ -1479,7 +2387,112 @@ def handle_order_user_message(user_id: str, message: str) -> ChatResponse:
     )
 
 
-def handle_user_message(user_id: str, message: str) -> ChatResponse:
+def format_receipt_draft_summary(draft: dict[str, Any]) -> str:
+    if not draft:
+        return "暂无入库草稿"
+    lines = [
+        f"入库日期：{draft.get('date') or '未填写'}",
+    ]
+    items = draft.get("items") if isinstance(draft.get("items"), list) else []
+    if not items:
+        lines.append("成品：未填写")
+    else:
+        lines.append("成品：")
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            parts = [
+                str(item.get("code") or "").strip(),
+                str(item.get("name") or "未填写成品").strip(),
+                str(item.get("spec") or "").strip(),
+                f"{item.get('qty') if item.get('qty') is not None else '未填写数量'}{item.get('unit') or ''}",
+            ]
+            lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
+    return "\n".join(lines)
+
+
+def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
+    command = normalize_command(message)
+    if command in ORDER_CANCEL_COMMANDS:
+        clear_receipt_draft(user_id)
+        return ChatResponse(
+            user_id=user_id,
+            answer="已清空当前入库草稿。请重新发送产成品入库照片。",
+            history_length=0,
+        )
+
+    if command in ORDER_CONFIRM_COMMANDS:
+        draft = get_receipt_draft(user_id)
+        missing = receipt_missing_fields(draft)
+        if missing:
+            return ChatResponse(
+                user_id=user_id,
+                answer=(
+                    "当前入库记录还不能保存，缺少："
+                    + "、".join(missing)
+                    + "\n"
+                    + format_receipt_draft_summary(draft)
+                    + "\n请重新发送清晰照片，或发“取消”清空。"
+                ),
+                history_length=0,
+            )
+
+        try:
+            receipt_id, line_count = save_confirmed_receipt(draft)
+        except Exception as exc:
+            logger.warning("receipt_save_failed user_id=%s error=%s", user_id, exc)
+            return ChatResponse(
+                user_id=user_id,
+                answer="入库记录保存失败了，请稍后再试，或联系管理员查看后台日志。",
+                history_length=0,
+            )
+
+        clear_receipt_draft(user_id)
+        return ChatResponse(
+            user_id=user_id,
+            answer=f"已保存产成品入库记录 {receipt_id}，共 {line_count} 行成品。",
+            history_length=0,
+        )
+
+    return ChatResponse(
+        user_id=user_id,
+        answer="当前是入库模式。请发送产成品入库照片；识别后我会发清单给你确认。发“订单”可切到订单模式。",
+        history_length=0,
+    )
+
+
+def handle_receipt_photo_input(user_id: str, image_bytes: bytes, mime_type: str | None, raw_ref: str) -> ChatResponse:
+    try:
+        draft = llm_parse_receipt_photo(image_bytes, mime_type, raw_ref)
+    except Exception as exc:
+        logger.warning("receipt_photo_parse_failed user_id=%s raw_ref=%s error=%s", user_id, raw_ref, exc)
+        if "vision model is not configured" in str(exc):
+            answer = "入库照片已收到，但当前视觉模型还没配置好。请稍后再试，或先人工记录。"
+        else:
+            answer = "这张入库照片我没有识别成功。请重新拍清楚成品名称和数量后再发。"
+        return ChatResponse(user_id=user_id, answer=answer, history_length=0)
+
+    save_receipt_draft(user_id, draft)
+    missing = receipt_missing_fields(draft)
+    summary = format_receipt_draft_summary(draft)
+    if missing:
+        answer = (
+            "我先把照片识别成入库草稿，还缺："
+            + "、".join(missing)
+            + "\n"
+            + summary
+            + "\n请重新发送清晰照片，或发“取消”清空。"
+        )
+    else:
+        answer = (
+            "我把照片识别成待确认入库记录：\n"
+            + summary
+            + "\n确认无误请回复“确认”；不对请重新发送照片。"
+        )
+    return ChatResponse(user_id=user_id, answer=answer, history_length=0)
+
+
+def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) -> ChatResponse:
     user_id = user_id.strip()
     message = message.strip()
 
@@ -1506,9 +2519,17 @@ def handle_user_message(user_id: str, message: str) -> ChatResponse:
             history_length=user_order_count(user_id),
         )
 
+    if command in RECEIPT_MODE_COMMANDS:
+        set_session_mode(user_id, SESSION_MODE_RECEIPT)
+        return ChatResponse(
+            user_id=user_id,
+            answer="已切换到入库模式。请发送产成品入库照片；识别后我会先整理成草稿让你确认。发“订单”可切回订单模式。",
+            history_length=0,
+        )
+
     if inline_order_message is not None:
         set_session_mode(user_id, SESSION_MODE_ORDER)
-        return handle_order_user_message(user_id, inline_order_message)
+        return handle_order_user_message(user_id, inline_order_message, raw_ref=raw_ref)
 
     if command in INTERVIEW_MODE_COMMANDS:
         set_session_mode(user_id, SESSION_MODE_INTERVIEW)
@@ -1519,7 +2540,10 @@ def handle_user_message(user_id: str, message: str) -> ChatResponse:
         )
 
     if get_session_mode(user_id) == SESSION_MODE_ORDER:
-        return handle_order_user_message(user_id, message)
+        return handle_order_user_message(user_id, message, raw_ref=raw_ref)
+
+    if get_session_mode(user_id) == SESSION_MODE_RECEIPT:
+        return handle_receipt_user_message(user_id, message)
 
     with MEMORY_LOCK:
         memory = load_memory()
@@ -1692,7 +2716,8 @@ def answer_wecom_message(message: WecomMessage) -> str:
         memory_user_id = f"user:{message.sender_user_id or message.chat_id}"
         llm_message = content
 
-    return handle_user_message(memory_user_id, llm_message).answer
+    raw_ref = f"wecom:{message.chat_id or message.sender_user_id}:{message.msg_id}"
+    return handle_user_message(memory_user_id, llm_message, raw_ref=raw_ref).answer
 
 
 def get_wecom_kf_crypto() -> WXBizMsgCrypt:
@@ -2023,6 +3048,114 @@ def send_wecom_kf_text(open_kfid: str, external_userid: str, content: str) -> No
     logger.info("wecom_kf_send_success open_kfid=%s external_userid=%s", open_kfid, external_userid)
 
 
+def get_wecom_kf_media(media_id: str) -> tuple[bytes, str, str]:
+    if not media_id:
+        raise RuntimeError("media_id is required")
+
+    access_token = get_wecom_kf_access_token()
+    response = httpx.get(
+        "https://qyapi.weixin.qq.com/cgi-bin/media/get",
+        params={"access_token": access_token, "media_id": media_id},
+        timeout=HTTP_TIMEOUT_SECONDS,
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "").split(";")[0].strip()
+    if content_type == "application/json":
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("WeCom media/get returned invalid JSON") from exc
+        raise RuntimeError(f"WeCom media/get failed: {data}")
+
+    filename = media_id
+    disposition = response.headers.get("content-disposition", "")
+    match = re.search(r'filename="?([^";]+)"?', disposition)
+    if match:
+        filename = match.group(1)
+    return response.content, content_type, filename
+
+
+def save_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str, Any]]:
+    payloads = parse_excel_order_payloads(file_bytes, raw_ref)
+    saved: list[dict[str, Any]] = []
+    for payload in payloads:
+        payload["confirmed"] = True
+        payload["status"] = ORDER_STATUS_NEW
+        saved.append(insert_order_payload(payload))
+    return saved
+
+
+def format_saved_order_ids(saved_orders: list[dict[str, Any]]) -> str:
+    ids = [str(order.get("id")) for order in saved_orders if order.get("id")]
+    return "、".join(ids)
+
+
+def handle_excel_order_input(user_id: str, file_bytes: bytes, raw_ref: str) -> ChatResponse:
+    try:
+        saved = save_excel_order_payloads(file_bytes, raw_ref)
+    except Exception as exc:
+        logger.warning("excel_order_import_failed user_id=%s raw_ref=%s error=%s", user_id, raw_ref, exc)
+        return ChatResponse(
+            user_id=user_id,
+            answer="Excel订单解析失败了。请确认文件是标准订单表，并包含商品名称和数量列。",
+            history_length=user_order_count(user_id),
+        )
+
+    line_count = sum(len(order.get("items") or []) for order in saved)
+    return ChatResponse(
+        user_id=user_id,
+        answer=f"Excel订单已入库，ID {format_saved_order_ids(saved)}，共 {line_count} 行商品。",
+        history_length=user_order_count(user_id),
+    )
+
+
+def handle_photo_order_input(user_id: str, image_bytes: bytes, mime_type: str | None, raw_ref: str) -> ChatResponse:
+    try:
+        draft = llm_parse_photo_order(image_bytes, mime_type, raw_ref)
+    except Exception as exc:
+        logger.warning("photo_order_parse_failed user_id=%s raw_ref=%s error=%s", user_id, raw_ref, exc)
+        if "vision model is not configured" in str(exc):
+            return ChatResponse(
+                user_id=user_id,
+                answer="照片订单识别已收到，但当前视觉模型还没配置好。请先用文字发送门店、商品和数量。",
+                history_length=user_order_count(user_id),
+            )
+        return ChatResponse(
+            user_id=user_id,
+            answer="这张照片我没有识别成功。请重新拍清楚订单表，或直接用文字发送门店、商品和数量。",
+            history_length=user_order_count(user_id),
+        )
+
+    draft["confirmed"] = False
+    draft["status"] = ORDER_STATUS_NEW
+    save_order_draft(user_id, draft)
+
+    missing = order_draft_missing_fields(draft)
+    summary = format_order_draft_summary(draft)
+    if missing:
+        answer = (
+            "我先把照片识别成订单草稿，还缺："
+            + "、".join(missing)
+            + "\n"
+            + summary
+            + "\n请直接补充缺失信息，或发“取消”清空。"
+        )
+    else:
+        answer = (
+            "我把照片识别成待确认订单：\n"
+            + summary
+            + "\n确认无误请回复“确认”；要修改就直接发修改内容。"
+        )
+
+    return ChatResponse(
+        user_id=user_id,
+        answer=answer,
+        history_length=user_order_count(user_id),
+    )
+
+
 def maybe_archive_wecom_kf_event(event_info: dict[str, Any]) -> None:
     event_type = str(event_info.get("event_type") or "")
     open_kfid = str(event_info.get("open_kfid") or "")
@@ -2070,9 +3203,49 @@ def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
             maybe_archive_wecom_kf_event(event_info)
         return
 
+    session_id = f"kf:{open_kfid}:{external_userid}" if open_kfid and external_userid else ""
+    raw_ref = f"kf:{open_kfid}:{external_userid}:{msg_id}"
+
+    if msg_type == "image":
+        media_id = str(item.get("image", {}).get("media_id") or "")
+        if not media_id or not open_kfid or not external_userid:
+            logger.info("wecom_kf_image_skipped msg_id=%s", msg_id)
+            return
+        try:
+            media_bytes, content_type, _filename = get_wecom_kf_media(media_id)
+            if get_session_mode(session_id) == SESSION_MODE_RECEIPT:
+                answer = handle_receipt_photo_input(session_id, media_bytes, content_type, raw_ref).answer
+            else:
+                answer = handle_photo_order_input(session_id, media_bytes, content_type, raw_ref).answer
+        except Exception as exc:
+            logger.warning("wecom_kf_image_order_failed msg_id=%s media_id=%s error=%s", msg_id, media_id, exc)
+            answer = "这张图片处理失败了，请稍后再试，或直接用文字发送门店、商品和数量。"
+        send_wecom_kf_text(open_kfid, external_userid, answer)
+        return
+
+    if msg_type == "file":
+        media_id = str(item.get("file", {}).get("media_id") or "")
+        filename = str(item.get("file", {}).get("filename") or item.get("file", {}).get("file_name") or media_id)
+        if not media_id or not open_kfid or not external_userid:
+            logger.info("wecom_kf_file_skipped msg_id=%s", msg_id)
+            return
+        try:
+            media_bytes, content_type, downloaded_name = get_wecom_kf_media(media_id)
+            filename = downloaded_name or filename
+            extension = Path(filename).suffix.lower()
+            if extension not in {".xlsx", ".xlsm"} and "spreadsheet" not in content_type:
+                answer = "这个文件我暂时只支持标准 Excel 订单表。"
+            else:
+                answer = handle_excel_order_input(session_id, media_bytes, raw_ref=f"{raw_ref}:{filename}").answer
+        except Exception as exc:
+            logger.warning("wecom_kf_file_order_failed msg_id=%s media_id=%s error=%s", msg_id, media_id, exc)
+            answer = "这个文件处理失败了。请确认是标准 Excel 订单表后重发。"
+        send_wecom_kf_text(open_kfid, external_userid, answer)
+        return
+
     if msg_type != "text":
         if open_kfid and external_userid:
-            send_wecom_kf_text(open_kfid, external_userid, "目前我先支持文字消息，图片、文件后面再接。")
+            send_wecom_kf_text(open_kfid, external_userid, "目前我支持文字加单、订单照片和标准 Excel。")
         return
 
     content = str(item.get("text", {}).get("content") or "").strip()
@@ -2080,8 +3253,7 @@ def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
         logger.info("wecom_kf_text_skipped msg_id=%s", msg_id)
         return
 
-    session_id = f"kf:{open_kfid}:{external_userid}"
-    answer = handle_user_message(session_id, content).answer
+    answer = handle_user_message(session_id, content, raw_ref=raw_ref).answer
     send_wecom_kf_text(open_kfid, external_userid, answer)
 
 
@@ -2241,6 +3413,149 @@ async def wecom_kf_callback(request: Request, background_tasks: BackgroundTasks)
 @app.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest) -> ChatResponse:
     return handle_user_message(payload.user_id, payload.message)
+
+
+def parse_ids_param(ids: str | None) -> list[int]:
+    if not ids:
+        return []
+    parsed: list[int] = []
+    for part in ids.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parsed.append(int(part))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid id: {part}") from exc
+    return parsed
+
+
+def validate_iso_date_param(value: str, name: str) -> str:
+    if not value:
+        raise HTTPException(status_code=400, detail=f"{name} is required")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{name} must be YYYY-MM-DD") from exc
+
+
+def require_robot_api_token(request: Request) -> None:
+    authorization = request.headers.get("authorization", "")
+    expected = f"Bearer {ROBOT_API_TOKEN}" if ROBOT_API_TOKEN else ""
+    if not expected or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid robot api token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@app.get("/api/orders")
+def api_orders(
+    request: Request,
+    status: str = Query(default=ORDER_STATUS_NEW),
+    order_date: str | None = Query(default=None),
+    ids: str | None = Query(default=None),
+) -> dict[str, list[dict[str, Any]]]:
+    require_robot_api_token(request)
+    parsed_ids = parse_ids_param(ids)
+    if parsed_ids:
+        return {"orders": query_order_payloads(ids=parsed_ids)}
+
+    if status not in ORDER_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be new, fetched, or all")
+    normalized_order_date = validate_iso_date_param(order_date or "", "order_date")
+    query_status = None if status == ORDER_STATUS_ALL else status
+    return {"orders": query_order_payloads(status=query_status, order_date=normalized_order_date)}
+
+
+@app.post("/api/orders/mark_fetched")
+def api_mark_fetched(request: Request, payload: MarkFetchedRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    return mark_order_payloads_fetched(payload.ids)
+
+
+@app.get("/api/receipts")
+def api_receipts(
+    request: Request,
+    date: str = Query(...),
+) -> dict[str, list[dict[str, Any]]]:
+    require_robot_api_token(request)
+    normalized_date = validate_iso_date_param(date, "date")
+    return {"receipts": query_receipt_payloads(normalized_date)}
+
+
+@app.post("/api/orders/import/excel")
+async def api_import_excel(
+    request: Request,
+    file: UploadFile = File(...),
+    raw_ref: str | None = Query(default=None),
+) -> dict[str, Any]:
+    require_robot_api_token(request)
+    file_bytes = await file.read()
+    reference = raw_ref or file.filename or "api:excel"
+    try:
+        saved = save_excel_order_payloads(file_bytes, reference)
+    except Exception as exc:
+        logger.warning("api_excel_import_failed raw_ref=%s error=%s", reference, exc)
+        raise HTTPException(status_code=400, detail="Excel order import failed") from exc
+    return {"orders": saved}
+
+
+@app.post("/api/orders/import/photo")
+async def api_import_photo(
+    request: Request,
+    file: UploadFile = File(...),
+    user_id: str = Query(default="api"),
+    confirm: bool = Query(default=False),
+    raw_ref: str | None = Query(default=None),
+) -> dict[str, Any]:
+    require_robot_api_token(request)
+    image_bytes = await file.read()
+    reference = raw_ref or file.filename or "api:photo"
+    mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0]
+    try:
+        draft = llm_parse_photo_order(image_bytes, mime_type, reference)
+    except Exception as exc:
+        logger.warning("api_photo_import_failed raw_ref=%s error=%s", reference, exc)
+        if "vision model is not configured" in str(exc):
+            raise HTTPException(status_code=503, detail="Photo recognition vision model is not configured") from exc
+        raise HTTPException(status_code=400, detail="Photo order parse failed") from exc
+
+    if confirm:
+        missing = order_draft_missing_fields(draft)
+        if missing:
+            raise HTTPException(status_code=400, detail="missing fields: " + "、".join(missing))
+        draft["confirmed"] = True
+        saved = insert_order_payload(draft)
+        return {"order": saved}
+
+    save_order_draft(user_id, draft)
+    return {"draft": draft, "message": "photo parsed; confirm before it is visible from /api/orders"}
+
+
+@app.post("/api/orders/import/text")
+def api_import_text(request: Request, payload: TextOrderImportRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    raw_ref = payload.raw_ref or f"api:text:{payload.user_id}"
+    try:
+        draft = llm_parse_order_draft({}, payload.message)
+    except Exception as exc:
+        logger.warning("api_text_import_failed user_id=%s error=%s", payload.user_id, exc)
+        raise HTTPException(status_code=400, detail="Text order parse failed") from exc
+
+    draft["raw_ref"] = raw_ref
+    draft["raw_text"] = draft.get("raw_text") or payload.message
+    draft["confirmed"] = bool(payload.confirm)
+    if payload.confirm:
+        missing = order_draft_missing_fields(draft)
+        if missing:
+            raise HTTPException(status_code=400, detail="missing fields: " + "、".join(missing))
+        saved = insert_order_payload(draft)
+        return {"order": saved}
+
+    save_order_draft(payload.user_id, draft)
+    return {"draft": normalize_order_payload(draft), "message": "text parsed; confirm before it is visible from /api/orders"}
 
 
 @app.get("/memory/{user_id}", response_model=MemoryLengthResponse)

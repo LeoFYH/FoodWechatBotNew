@@ -3,6 +3,10 @@ memory.json
 interviews.json
 session_state.json
 orders.json
+orders.db
+receipts.db
+*.db-wal
+*.db-shm
 kf_cursors.json
 __pycache__/
 *.pyc
