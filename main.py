@@ -1225,11 +1225,6 @@ ORDER_LIKE_KEYWORDS = {
     "追",
     "改",
     "换",
-    "馄饨",
-    "小鱼",
-    "鸡汤",
-    "虾肉",
-    "鼓楼",
     "门店",
     "箱",
     "件",
@@ -1742,7 +1737,7 @@ def llm_parse_order_draft(existing_draft: dict[str, Any], message: str) -> dict[
 
     today = datetime.now().date().isoformat()
     prompt = f"""
-你是馄饨侯订单机器人。请按接口契约把微信消息整理成 Web 工具可直接使用的 JSON。
+你是通用订单机器人。请按接口契约把微信消息整理成 Web 工具可直接使用的 JSON。
 
 只输出一个 JSON 对象，不要解释，不要 Markdown。
 
@@ -1955,7 +1950,7 @@ def llm_parse_photo_order(image_bytes: bytes, mime_type: str | None, raw_ref: st
     today = datetime.now().date().isoformat()
     current_year = datetime.now().year
     prompt = f"""
-你是馄饨侯订单照片识别助手。请读取图片中的订单表格或手写订单，输出 Web 工具可直接使用的基础订单 JSON。
+你是通用订单照片识别助手。请读取图片中的订单表格或手写订单，输出 Web 工具可直接使用的基础订单 JSON。
 
 只输出一个 JSON 对象，不要解释，不要 Markdown。
 
@@ -2009,7 +2004,7 @@ def llm_parse_receipt_photo(image_bytes: bytes, mime_type: str | None, raw_ref: 
 {{
   "date": "YYYY-MM-DD",
   "items": [
-    {{"code": null, "name": "鸡汤虾肉馄饨", "spec": null, "unit": "箱", "qty": 50}}
+    {{"code": null, "name": "成品名称", "spec": null, "unit": "箱", "qty": 50}}
   ]
 }}
 
