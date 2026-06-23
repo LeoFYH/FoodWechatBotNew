@@ -1,0 +1,19 @@
+POSTGRES_BACKENDS = {"pg", "postgres", "postgresql"}
+
+ORDER_STATUS_CANCELLED = "cancelled"
+ORDER_STATUS_NEW = "new"
+ORDER_STATUS_FETCHED = "fetched"
+ORDER_STATUS_ALL = "all"
+ORDER_KIND_BASE = "base"
+ORDER_KIND_PATCH = "patch"
+
+RECEIPT_STATUS_CONFIRMED = "confirmed"
+RECEIPT_STATUS_FETCHED = "fetched"
+RECEIPT_STATUS_CANCELLED = "cancelled"
+RECEIPT_STATUS_NEW = "new"
+RECEIPT_STATUS_ALL = "all"
+
+STATE_CHANNEL_MEMORY = "memory"
+STATE_CHANNEL_SESSION = "session_state"
+STATE_CHANNEL_INTERVIEW_ARCHIVE = "interview_archive"
+CURSOR_CHANNEL_WECOM_KF = "wecom_kf"

@@ -196,6 +196,25 @@ status=fetched
 }
 ```
 
+### 退回为未拉取
+
+```http
+POST /api/orders/unmark
+Content-Type: application/json
+
+{
+  "ids": [123, 456]
+}
+```
+
+成功后这些订单会回到：
+
+```text
+status=new
+```
+
+重复调用是幂等的；已经是 `new` 的 id 也算 `succeeded`，不存在或已取消的 id 算 `failed`。
+
 ### 重拉 / 查询
 
 ```http
@@ -210,9 +229,11 @@ GET /api/orders?status=all&order_date=2026-06-21
 
 ```http
 GET /api/receipts?date=2026-06-21
+GET /api/receipts?status=fetched&date=2026-06-21
+GET /api/receipts?status=all&date=2026-06-21
 ```
 
-读取独立的 `receipts.db`，不读订单库。
+读取独立的 `receipts.db`，不读订单库。默认 `status=new`，只返回还没被 Web 工具标记已拉取的入库数据；`status=fetched` 可重拉已标记数据；`status=all` 返回未取消数据。
 
 返回：
 
@@ -236,7 +257,28 @@ GET /api/receipts?date=2026-06-21
 }
 ```
 
-入库数据不带 `store`，不调用 `mark_fetched`。
+入库数据不带 `store`。
+
+### 标记 / 退回产成品入库
+
+```http
+POST /api/receipts/mark_fetched
+POST /api/receipts/unmark
+Content-Type: application/json
+
+{
+  "ids": ["r001", "r002"]
+}
+```
+
+`mark_fetched` 会把入库记录标记为已拉取，默认 `/api/receipts?date=...` 不再返回这些记录。`unmark` 会退回为未拉取，方便 Web 工具作废本批后重新同步。返回格式与订单一致：
+
+```json
+{
+  "succeeded": ["r001"],
+  "failed": ["r002"]
+}
+```
 
 ## 调试导入接口
 
@@ -327,19 +369,24 @@ python -m py_compile main.py
 
 - `GET /api/orders?status=new&order_date=YYYY-MM-DD`
 - `POST /api/orders/mark_fetched`
+- `POST /api/orders/unmark`
 - `GET /api/orders?status=fetched&order_date=YYYY-MM-DD`
+- `GET /api/receipts?status=fetched&date=YYYY-MM-DD`
+- `POST /api/receipts/mark_fetched`
+- `POST /api/receipts/unmark`
 
 验证结果：
 
 - `status=new` 可拉到新订单。
 - 调 `mark_fetched` 后，`status=new` 不再返回该订单。
 - `status=fetched` 可重拉已拉取订单。
+- 调 `unmark` 后，订单或入库数据会重新进入默认待同步列表。
 
 还验证了 Excel 解析后可写入 SQLite，并符合新 JSON 结构。
 
 ## 注意事项
 
-- Web 工具不要直接连机器人 SQLite，只通过 `/api/orders` 和 `/api/orders/mark_fetched`。
+- Web 工具不要直接连机器人 SQLite，只通过 `/api/orders`、`/api/orders/mark_fetched`、`/api/orders/unmark`、`/api/receipts` 和入库 mark/unmark 接口。
 - Web 工具必须先成功并入汇总，再调用 `mark_fetched`。
 - 照片识别调用 `VISION_MODEL`；未配置 `VISION_API_KEY` 时不会入库，会提示视觉模型还没配置好。
 - Excel 标准表必须至少能识别出商品名称和数量列。
@@ -348,4 +395,4 @@ python -m py_compile main.py
 - `deliver_date` 只是送达/到货备注，不参与分批；消息收到/入库时间写入 `created_at`，三者不能混用。
 - `items[].qty` 入库前统一清洗成数字，单位放在 `unit`。
 - confirmed 的 patch 必须有 `store`，否则拒绝入库。
-- 产成品入库数据写入独立 `receipts.db`，GET `/api/receipts` 不返回 `store`。
+- 产成品入库数据写入独立 `receipts.db`，GET `/api/receipts` 不返回 `store`，生成入库单成功后由 Web 工具调用入库 `mark_fetched`。

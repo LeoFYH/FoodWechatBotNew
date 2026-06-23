@@ -1,0 +1,2 @@
+TABLE = "api_clients"
+

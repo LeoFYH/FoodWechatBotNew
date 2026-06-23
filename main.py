@@ -31,6 +31,17 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from wx_crypt import WXBizMsgCrypt, WxChannel_Wecom
 
+from services.business_intent import (
+    INTENT_CANCEL,
+    INTENT_CHAT,
+    INTENT_CONFIRM,
+    INTENT_EXIT,
+    INTENT_REJECT,
+    INTENT_UNCLEAR,
+    BusinessIntent,
+    classify_business_intent,
+)
+import models
 
 load_dotenv()
 
@@ -212,6 +223,10 @@ class MarkFetchedRequest(BaseModel):
     ids: list[int] = Field(default_factory=list)
 
 
+class IdsRequest(BaseModel):
+    ids: list[Any] = Field(default_factory=list)
+
+
 class TextOrderImportRequest(BaseModel):
     user_id: str = Field(..., min_length=1)
     message: str = Field(..., min_length=1)
@@ -220,6 +235,9 @@ class TextOrderImportRequest(BaseModel):
 
 
 def load_memory() -> dict:
+    if models.is_enabled():
+        return models.load_memory()
+
     if not MEMORY_FILE.exists():
         return {}
 
@@ -239,6 +257,10 @@ def load_memory() -> dict:
 
 
 def save_memory(memory: dict) -> None:
+    if models.is_enabled():
+        models.save_memory(memory)
+        return
+
     MEMORY_FILE.write_text(
         json.dumps(memory, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -250,6 +272,9 @@ def now_iso() -> str:
 
 
 def load_session_state() -> dict[str, dict[str, Any]]:
+    if models.is_enabled():
+        return models.load_session_state()
+
     if not SESSION_STATE_FILE.exists():
         return {}
 
@@ -273,6 +298,10 @@ def load_session_state() -> dict[str, dict[str, Any]]:
 
 
 def save_session_state(state: dict[str, dict[str, Any]]) -> None:
+    if models.is_enabled():
+        models.save_session_state(state)
+        return
+
     SESSION_STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -375,6 +404,9 @@ def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if missing:
             raise ValueError("confirmed order missing fields: " + ",".join(missing))
 
+    if models.is_enabled():
+        return models.insert_order_payload(normalized)
+
     created_at = normalized.get("created_at") or now_iso()
     normalized["created_at"] = created_at
     normalized["order_date"] = str(normalized.get("order_date") or "")
@@ -419,6 +451,9 @@ def query_order_payloads(
     ids: list[int] | None = None,
     order_date: str | None = None,
 ) -> list[dict[str, Any]]:
+    if models.is_enabled():
+        return models.query_order_payloads(status=status, ids=ids, order_date=order_date)
+
     clauses = ["confirmed = 1", "status != ?"]
     params: list[Any] = [ORDER_STATUS_CANCELLED]
     if ids:
@@ -443,6 +478,9 @@ def query_order_payloads(
 
 
 def mark_order_payloads_fetched(ids: list[int]) -> dict[str, list[int]]:
+    if models.is_enabled():
+        return models.mark_order_payloads_fetched(ids)
+
     clean_ids = sorted({int(order_id) for order_id in ids if int(order_id) > 0})
     if not clean_ids:
         return {"succeeded": [], "failed": []}
@@ -486,6 +524,53 @@ def mark_order_payloads_fetched(ids: list[int]) -> dict[str, list[int]]:
             return {"succeeded": succeeded, "failed": failed}
 
 
+def unmark_order_payloads(ids: list[int]) -> dict[str, list[int]]:
+    if models.is_enabled():
+        return models.unmark_order_payloads(ids)
+
+    clean_ids = sorted({int(order_id) for order_id in ids if int(order_id) > 0})
+    if not clean_ids:
+        return {"succeeded": [], "failed": []}
+
+    placeholders = ",".join("?" for _ in clean_ids)
+    with ORDER_DB_LOCK:
+        with order_db_connection() as conn:
+            existing_rows = conn.execute(
+                f"SELECT id FROM order_entries WHERE id IN ({placeholders}) AND status != ?",
+                [*clean_ids, ORDER_STATUS_CANCELLED],
+            ).fetchall()
+            existing_ids = {int(row["id"]) for row in existing_rows}
+            succeeded = [order_id for order_id in clean_ids if order_id in existing_ids]
+            failed = [order_id for order_id in clean_ids if order_id not in existing_ids]
+
+            if not succeeded:
+                return {"succeeded": [], "failed": failed}
+
+            update_placeholders = ",".join("?" for _ in succeeded)
+            conn.execute(
+                f"""
+                UPDATE order_entries
+                SET status = 'new',
+                    updated_at = ?
+                WHERE id IN ({update_placeholders})
+                """,
+                [now_iso(), *succeeded],
+            )
+            rows = conn.execute(
+                f"SELECT * FROM order_entries WHERE id IN ({update_placeholders})",
+                succeeded,
+            ).fetchall()
+            for row in rows:
+                payload = row_to_order_payload(row)
+                payload["status"] = ORDER_STATUS_NEW
+                conn.execute(
+                    "UPDATE order_entries SET payload_json = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), int(row["id"])),
+                )
+            conn.commit()
+            return {"succeeded": succeeded, "failed": failed}
+
+
 def raw_ref_belongs_to_user(raw_ref: str, user_id: str) -> bool:
     raw_ref = str(raw_ref or "")
     return raw_ref == user_id or raw_ref.startswith(f"{user_id}:")
@@ -506,6 +591,15 @@ def summarize_order_for_reply(payload: dict[str, Any]) -> str:
 
 
 def cancel_latest_order_for_user(user_id: str) -> str:
+    if models.is_enabled():
+        result = models.cancel_latest_order_for_user(user_id)
+        if result.get("outcome") == "not_found":
+            return "没找到你最近确认的订单，暂时没有可撤回的。"
+        if result.get("outcome") == "fetched":
+            return "这单已被排产/发货使用，不能直接撤回，需要联系数据部处理。"
+        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        return f"好，刚那单（{summarize_order_for_reply(payload)}）撤回了，重新发我吧。"
+
     with ORDER_DB_LOCK:
         with order_db_connection() as conn:
             rows = conn.execute(
@@ -562,6 +656,15 @@ def summarize_receipt_for_reply(payload: dict[str, Any]) -> str:
 
 def cancel_latest_receipt_for_user(user_id: str) -> str:
     today = datetime.now().date().isoformat()
+    if models.is_enabled():
+        result = models.cancel_latest_receipt_for_user(user_id, today)
+        if result.get("outcome") == "cancelled":
+            payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+            return f"好，刚那条入库记录（{summarize_receipt_for_reply(payload)}）撤回了。"
+        if result.get("outcome") == "fetched":
+            return "这条入库记录已被入库工具使用，不能直接撤回，需要联系数据部处理。"
+        return "没找到你今天确认的入库记录，暂时没有可撤回的。"
+
     with RECEIPT_DB_LOCK:
         with receipt_db_connection() as conn:
             rows = conn.execute(
@@ -582,7 +685,11 @@ def cancel_latest_receipt_for_user(user_id: str) -> str:
                 if not raw_ref_belongs_to_user(str(payload.get("raw_ref") or ""), user_id):
                     continue
 
-                payload["status"] = ORDER_STATUS_CANCELLED
+                status = str(row["status"] or payload.get("status") or "")
+                if status == RECEIPT_STATUS_FETCHED:
+                    return "这条入库记录已被入库工具使用，不能直接撤回，需要联系数据部处理。"
+
+                payload["status"] = RECEIPT_STATUS_CANCELLED
                 payload["cancelled_at"] = now_iso()
                 conn.execute(
                     """
@@ -674,6 +781,11 @@ def normalize_receipt_item(item: dict[str, Any]) -> dict[str, Any]:
 def normalize_receipt_payload(data: dict[str, Any]) -> dict[str, Any]:
     created_at = clean_order_value(data.get("created_at")) or now_iso()
     date = normalize_order_date_text(data.get("date")) or fallback_order_date(created_at)
+    status = clean_order_value(data.get("status")) or RECEIPT_STATUS_CONFIRMED
+    if status == RECEIPT_STATUS_NEW:
+        status = RECEIPT_STATUS_CONFIRMED
+    if status not in RECEIPT_STORAGE_STATUSES:
+        status = RECEIPT_STATUS_CONFIRMED
     items = data.get("items")
     if not isinstance(items, list):
         items = []
@@ -692,6 +804,7 @@ def normalize_receipt_payload(data: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "date": date,
         "items": normalized_items,
+        "status": status,
         "created_at": created_at,
     }
     if data.get("id") not in (None, ""):
@@ -729,6 +842,7 @@ def row_to_receipt_payload(row: sqlite3.Row) -> dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
     payload["date"] = str(row["date"] or payload.get("date") or "")
+    payload["status"] = str(row["status"] or payload.get("status") or RECEIPT_STATUS_CONFIRMED)
     normalized = normalize_receipt_payload(payload)
     normalized["id"] = f"r{int(row['id']):03d}"
     normalized["date"] = str(row["date"] or normalized.get("date") or "")
@@ -744,6 +858,9 @@ def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
     missing = receipt_missing_fields(normalized)
     if missing:
         raise ValueError("receipt missing fields: " + ",".join(missing))
+
+    if models.is_enabled():
+        return models.insert_receipt_payload(normalized)
 
     with RECEIPT_DB_LOCK:
         with receipt_db_connection() as conn:
@@ -777,15 +894,135 @@ def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def query_receipt_payloads(date: str) -> list[dict[str, Any]]:
+    return query_receipt_payloads_by_status(date, RECEIPT_STATUS_NEW)
+
+
+def receipt_status_to_storage_filter(status: str | None) -> str | None:
+    if not status or status == RECEIPT_STATUS_NEW:
+        return RECEIPT_STATUS_CONFIRMED
+    if status == RECEIPT_STATUS_ALL:
+        return None
+    return status
+
+
+def receipt_id_label(receipt_id: int) -> str:
+    return f"r{int(receipt_id):03d}"
+
+
+def parse_receipt_id_values(ids: list[Any]) -> tuple[list[int], list[str]]:
+    clean_ids: list[int] = []
+    failed: list[str] = []
+    seen: set[int] = set()
+    for raw_id in ids:
+        text = str(raw_id or "").strip()
+        if text.lower().startswith("r"):
+            text = text[1:]
+        try:
+            receipt_id = int(text)
+        except ValueError:
+            failed.append(str(raw_id))
+            continue
+        if receipt_id <= 0:
+            failed.append(str(raw_id))
+            continue
+        if receipt_id in seen:
+            continue
+        seen.add(receipt_id)
+        clean_ids.append(receipt_id)
+    return sorted(clean_ids), failed
+
+
+def update_receipt_payload_status(
+    ids: list[Any],
+    target_status: str,
+) -> dict[str, list[str]]:
+    if models.is_enabled():
+        if target_status == RECEIPT_STATUS_FETCHED:
+            return models.mark_receipt_payloads_fetched(ids)
+        return models.unmark_receipt_payloads(ids)
+
+    clean_ids, failed = parse_receipt_id_values(ids)
+    if not clean_ids:
+        return {"succeeded": [], "failed": failed}
+
+    placeholders = ",".join("?" for _ in clean_ids)
+    with RECEIPT_DB_LOCK:
+        with receipt_db_connection() as conn:
+            existing_rows = conn.execute(
+                f"SELECT id FROM receipt_entries WHERE id IN ({placeholders}) AND status != ?",
+                [*clean_ids, RECEIPT_STATUS_CANCELLED],
+            ).fetchall()
+            existing_ids = {int(row["id"]) for row in existing_rows}
+            succeeded_ints = [receipt_id for receipt_id in clean_ids if receipt_id in existing_ids]
+            failed.extend(receipt_id_label(receipt_id) for receipt_id in clean_ids if receipt_id not in existing_ids)
+
+            if not succeeded_ints:
+                return {"succeeded": [], "failed": failed}
+
+            update_placeholders = ",".join("?" for _ in succeeded_ints)
+            conn.execute(
+                f"""
+                UPDATE receipt_entries
+                SET status = ?,
+                    updated_at = ?
+                WHERE id IN ({update_placeholders})
+                """,
+                [target_status, now_iso(), *succeeded_ints],
+            )
+            rows = conn.execute(
+                f"SELECT * FROM receipt_entries WHERE id IN ({update_placeholders})",
+                succeeded_ints,
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                except json.JSONDecodeError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload["status"] = target_status
+                conn.execute(
+                    "UPDATE receipt_entries SET payload_json = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), int(row["id"])),
+                )
+            conn.commit()
+            return {
+                "succeeded": [receipt_id_label(receipt_id) for receipt_id in succeeded_ints],
+                "failed": failed,
+            }
+
+
+def mark_receipt_payloads_fetched(ids: list[Any]) -> dict[str, list[str]]:
+    return update_receipt_payload_status(ids, RECEIPT_STATUS_FETCHED)
+
+
+def unmark_receipt_payloads(ids: list[Any]) -> dict[str, list[str]]:
+    return update_receipt_payload_status(ids, RECEIPT_STATUS_CONFIRMED)
+
+
+def query_receipt_payloads_by_status(date: str, status: str | None = None) -> list[dict[str, Any]]:
+    if models.is_enabled():
+        return models.query_receipt_payloads(date, status=status)
+
+    storage_status = receipt_status_to_storage_filter(status)
+    clauses = ["date = ?", "status != ?"]
+    params: list[Any] = [date, RECEIPT_STATUS_CANCELLED]
+    if storage_status:
+        clauses.append("status = ?")
+        params.append(storage_status)
+    where_sql = " AND ".join(clauses)
     with receipt_db_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM receipt_entries WHERE date = ? AND status != 'cancelled' ORDER BY id ASC",
-            (date,),
+            f"SELECT * FROM receipt_entries WHERE {where_sql} ORDER BY id ASC",
+            params,
         ).fetchall()
     return [row_to_receipt_payload(row) for row in rows]
 
 
 def load_interview_archive() -> dict[str, dict[str, Any]]:
+    if models.is_enabled():
+        return models.load_interview_archive()
+
     if not INTERVIEW_ARCHIVE_FILE.exists():
         return {}
 
@@ -815,6 +1052,10 @@ def load_interview_archive() -> dict[str, dict[str, Any]]:
 
 
 def save_interview_archive(archive: dict[str, dict[str, Any]]) -> None:
+    if models.is_enabled():
+        models.save_interview_archive(archive)
+        return
+
     INTERVIEW_ARCHIVE_FILE.write_text(
         json.dumps(archive, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -914,11 +1155,18 @@ ORDER_STATUS_NEW = "new"
 ORDER_STATUS_FETCHED = "fetched"
 ORDER_STATUS_CANCELLED = "cancelled"
 ORDER_STATUS_ALL = "all"
+RECEIPT_STATUS_NEW = "new"
+RECEIPT_STATUS_CONFIRMED = "confirmed"
+RECEIPT_STATUS_FETCHED = "fetched"
+RECEIPT_STATUS_CANCELLED = "cancelled"
+RECEIPT_STATUS_ALL = "all"
 ORDER_CHANGE_ADD = "add"
 ORDER_CHANGE_MODIFY = "modify"
 ORDER_KINDS = {ORDER_KIND_BASE, ORDER_KIND_PATCH}
 ORDER_SOURCES = {ORDER_SOURCE_EXCEL, ORDER_SOURCE_PHOTO, ORDER_SOURCE_TEXT}
 ORDER_STATUSES = {ORDER_STATUS_NEW, ORDER_STATUS_FETCHED, ORDER_STATUS_ALL}
+RECEIPT_API_STATUSES = {RECEIPT_STATUS_NEW, RECEIPT_STATUS_FETCHED, RECEIPT_STATUS_ALL}
+RECEIPT_STORAGE_STATUSES = {RECEIPT_STATUS_CONFIRMED, RECEIPT_STATUS_FETCHED, RECEIPT_STATUS_CANCELLED}
 ORDER_CHANGE_TYPES = {ORDER_CHANGE_ADD, ORDER_CHANGE_MODIFY}
 
 BASE_ORDER_FIELDS = [
@@ -1142,7 +1390,9 @@ def is_confirm_command(command: str) -> bool:
         return True
     if command_contains_any(command, {"取消", "撤回", "不对", "不是", "别", "不要"}):
         return False
-    return command_contains_any(command, CONFIRM_LIKE_KEYWORDS)
+    if command_contains_any(command, CONFIRM_LIKE_KEYWORDS):
+        return True
+    return command in {"ok", "okay", "yes", "y"}
 
 
 def is_order_storage_query_command(command: str) -> bool:
@@ -1210,7 +1460,7 @@ def build_mode_help_message(user_id: str) -> str:
 def build_order_storage_query_reply(user_id: str) -> str:
     draft = get_order_draft(user_id)
     if order_draft_has_content(draft):
-        return "现在还有一张订单草稿没入库。确认没问题请回“确认入库”；要改就直接发修改内容。"
+        return "现在还有一张订单草稿没入库。确认没问题请回“确认 / 对 / ok / yes”；要改就直接发修改内容。"
     return (
         "我这里不编入库结果。订单只有在你回复“确认入库”后才会写进 orders.db。\n"
         "Web 工具同步时按订单的 order_date 拉取；如果工具是空，先确认刚才那单是否已经保存，以及工具选的下单日期是否和订单里的 order_date 一致。"
@@ -1708,6 +1958,62 @@ def format_order_draft_summary(draft: dict[str, Any]) -> str:
             lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
 
     return "\n".join(lines)
+
+
+def call_business_intent_llm(messages: list[dict[str, str]]) -> str:
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def classify_order_reply_intent(message: str, draft: dict[str, Any]) -> BusinessIntent:
+    return classify_business_intent(
+        message,
+        has_draft=order_draft_has_content(draft),
+        mode="order",
+        draft_summary=format_order_draft_summary(draft),
+        llm_classifier=call_business_intent_llm,
+    )
+
+
+def business_confirm_clarification(*, receipt: bool = False) -> str:
+    subject = "这条入库记录" if receipt else "这张订单"
+    return f"我不确定你是不是要保存{subject}。确认无误请回“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
+
+
+def save_confirmed_order_response(user_id: str, draft: dict[str, Any], history_length: int) -> ChatResponse:
+    if not order_draft_has_content(draft):
+        return ChatResponse(
+            user_id=user_id,
+            answer="现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。",
+            history_length=history_length,
+        )
+    missing = order_draft_missing_fields(draft)
+    if missing:
+        return ChatResponse(
+            user_id=user_id,
+            answer=missing_fields_reply(missing),
+            history_length=history_length,
+        )
+
+    try:
+        order_id, line_count = save_confirmed_order(user_id, draft)
+    except Exception as exc:
+        logger.warning("order_save_failed user_id=%s error=%s", user_id, exc)
+        return ChatResponse(
+            user_id=user_id,
+            answer="订单保存失败了，请稍后再试，或联系管理员查看后台日志。",
+            history_length=history_length,
+        )
+
+    clear_order_draft(user_id)
+    return ChatResponse(
+        user_id=user_id,
+        answer=f"已保存订单入库，ID {order_id}，共 {line_count} 行商品。继续发下一张即可。",
+        history_length=history_length + line_count,
+    )
 
 
 def llm_parse_order_draft(existing_draft: dict[str, Any], message: str) -> dict[str, Any]:
@@ -2698,6 +3004,8 @@ def call_customer_chat_llm(user_id: str, history: list[dict[str, str]]) -> str:
 def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = None) -> ChatResponse:
     command = normalize_command(message)
     history_length = user_order_count(user_id)
+    existing_draft = get_order_draft(user_id)
+    has_existing_draft = order_draft_has_content(existing_draft)
 
     if command in ORDER_CANCEL_COMMANDS:
         clear_order_draft(user_id)
@@ -2707,40 +3015,43 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
             history_length=history_length,
         )
 
+    if has_existing_draft:
+        intent = classify_order_reply_intent(message, existing_draft)
+        if intent.intent == INTENT_CANCEL and intent.is_rule:
+            clear_order_draft(user_id)
+            return ChatResponse(
+                user_id=user_id,
+                answer="已清空当前订单草稿。你可以直接发送下一张订单。",
+                history_length=history_length,
+            )
+        if intent.intent == INTENT_EXIT and intent.is_rule:
+            return ChatResponse(
+                user_id=user_id,
+                answer=exit_business_mode(user_id),
+                history_length=0,
+            )
+        if intent.intent == INTENT_CONFIRM:
+            return save_confirmed_order_response(user_id, existing_draft, history_length)
+        if intent.intent == INTENT_REJECT:
+            return ChatResponse(
+                user_id=user_id,
+                answer="这单我先不保存。要修改就直接发修改内容；发“取消”可以清空草稿。",
+                history_length=history_length,
+            )
+        if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT} and not looks_like_order_message(message):
+            return ChatResponse(
+                user_id=user_id,
+                answer=business_confirm_clarification(),
+                history_length=history_length,
+            )
+
     if is_confirm_command(command):
-        draft = get_order_draft(user_id)
-        if not order_draft_has_content(draft):
-            return ChatResponse(
-                user_id=user_id,
-                answer="现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。",
-                history_length=history_length,
-            )
-        missing = order_draft_missing_fields(draft)
-        if missing:
-            return ChatResponse(
-                user_id=user_id,
-                answer=missing_fields_reply(missing),
-                history_length=history_length,
-            )
-
-        try:
-            order_id, line_count = save_confirmed_order(user_id, draft)
-        except Exception as exc:
-            logger.warning("order_save_failed user_id=%s error=%s", user_id, exc)
-            return ChatResponse(
-                user_id=user_id,
-                answer="订单保存失败了，请稍后再试，或联系管理员查看后台日志。",
-                history_length=history_length,
-            )
-
-        clear_order_draft(user_id)
         return ChatResponse(
             user_id=user_id,
-            answer=f"已保存订单入库，ID {order_id}，共 {line_count} 行商品。继续发下一张即可。",
-            history_length=history_length + line_count,
+            answer="现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。",
+            history_length=history_length,
         )
 
-    existing_draft = get_order_draft(user_id)
     try:
         draft = llm_parse_order_draft(existing_draft, message)
     except Exception as exc:
@@ -2768,7 +3079,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
         answer = (
             "我整理成待确认订单：\n"
             + summary
-            + "\n确认无误请回复“确认”；要修改就直接发修改内容。"
+            + "\n确认无误请回复“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
         )
 
     return ChatResponse(
@@ -2802,8 +3113,53 @@ def format_receipt_draft_summary(draft: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def classify_receipt_reply_intent(message: str, draft: dict[str, Any]) -> BusinessIntent:
+    return classify_business_intent(
+        message,
+        has_draft=receipt_draft_has_content(draft),
+        mode="receipt",
+        draft_summary=format_receipt_draft_summary(draft),
+        llm_classifier=call_business_intent_llm,
+    )
+
+
+def save_confirmed_receipt_response(user_id: str, draft: dict[str, Any]) -> ChatResponse:
+    if not receipt_draft_has_content(draft):
+        return ChatResponse(
+            user_id=user_id,
+            answer="现在没有待确认的入库草稿。发产成品入库照片给我就行。",
+            history_length=0,
+        )
+    missing = receipt_missing_fields(draft)
+    if missing:
+        return ChatResponse(
+            user_id=user_id,
+            answer=missing_fields_reply(missing, receipt=True),
+            history_length=0,
+        )
+
+    try:
+        receipt_id, line_count = save_confirmed_receipt(draft)
+    except Exception as exc:
+        logger.warning("receipt_save_failed user_id=%s error=%s", user_id, exc)
+        return ChatResponse(
+            user_id=user_id,
+            answer="入库记录保存失败了，请稍后再试，或联系管理员查看后台日志。",
+            history_length=0,
+        )
+
+    clear_receipt_draft(user_id)
+    return ChatResponse(
+        user_id=user_id,
+        answer=f"已保存产成品入库记录 {receipt_id}，共 {line_count} 行成品。",
+        history_length=0,
+    )
+
+
 def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
     command = normalize_command(message)
+    draft = get_receipt_draft(user_id)
+    has_existing_draft = receipt_draft_has_content(draft)
     if command in ORDER_CANCEL_COMMANDS:
         clear_receipt_draft(user_id)
         return ChatResponse(
@@ -2812,36 +3168,40 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
             history_length=0,
         )
 
+    if has_existing_draft:
+        intent = classify_receipt_reply_intent(message, draft)
+        if intent.intent == INTENT_CANCEL and intent.is_rule:
+            clear_receipt_draft(user_id)
+            return ChatResponse(
+                user_id=user_id,
+                answer="已清空当前入库草稿。请重新发送产成品入库照片。",
+                history_length=0,
+            )
+        if intent.intent == INTENT_EXIT and intent.is_rule:
+            return ChatResponse(
+                user_id=user_id,
+                answer=exit_business_mode(user_id),
+                history_length=0,
+            )
+        if intent.intent == INTENT_CONFIRM:
+            return save_confirmed_receipt_response(user_id, draft)
+        if intent.intent == INTENT_REJECT:
+            return ChatResponse(
+                user_id=user_id,
+                answer="这条入库记录我先不保存。要修改请重新发送照片；发“取消”可以清空草稿。",
+                history_length=0,
+            )
+        if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT}:
+            return ChatResponse(
+                user_id=user_id,
+                answer=business_confirm_clarification(receipt=True),
+                history_length=0,
+            )
+
     if is_confirm_command(command):
-        draft = get_receipt_draft(user_id)
-        if not receipt_draft_has_content(draft):
-            return ChatResponse(
-                user_id=user_id,
-                answer="现在没有待确认的入库草稿。发产成品入库照片给我就行。",
-                history_length=0,
-            )
-        missing = receipt_missing_fields(draft)
-        if missing:
-            return ChatResponse(
-                user_id=user_id,
-                answer=missing_fields_reply(missing, receipt=True),
-                history_length=0,
-            )
-
-        try:
-            receipt_id, line_count = save_confirmed_receipt(draft)
-        except Exception as exc:
-            logger.warning("receipt_save_failed user_id=%s error=%s", user_id, exc)
-            return ChatResponse(
-                user_id=user_id,
-                answer="入库记录保存失败了，请稍后再试，或联系管理员查看后台日志。",
-                history_length=0,
-            )
-
-        clear_receipt_draft(user_id)
         return ChatResponse(
             user_id=user_id,
-            answer=f"已保存产成品入库记录 {receipt_id}，共 {line_count} 行成品。",
+            answer="现在没有待确认的入库草稿。发产成品入库照片给我就行。",
             history_length=0,
         )
 
@@ -2872,7 +3232,7 @@ def handle_receipt_photo_input(user_id: str, image_bytes: bytes, mime_type: str 
         answer = (
             "我把照片识别成待确认入库记录：\n"
             + summary
-            + "\n确认无误请回复“确认”；不对请重新发送照片。"
+            + "\n确认无误请回复“确认 / 对 / ok / yes”；不对请重新发送照片。"
         )
     return ChatResponse(user_id=user_id, answer=answer, history_length=0)
 
@@ -3039,11 +3399,15 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         return handle_order_user_message(user_id, inline_order_message, raw_ref=raw_ref)
 
     if current_mode == SESSION_MODE_ORDER:
+        if order_draft_has_content(get_order_draft(user_id)):
+            return handle_order_user_message(user_id, message, raw_ref=raw_ref)
         if looks_like_order_message(message):
             return handle_order_user_message(user_id, message, raw_ref=raw_ref)
         return handle_general_chat(user_id, message, mode_hint=SESSION_MODE_ORDER)
 
     if current_mode == SESSION_MODE_RECEIPT:
+        if receipt_draft_has_content(get_receipt_draft(user_id)):
+            return handle_receipt_user_message(user_id, message)
         return handle_general_chat(user_id, message, mode_hint=SESSION_MODE_RECEIPT)
 
     return handle_general_chat(user_id, message)
@@ -3346,6 +3710,9 @@ def get_wecom_kf_access_token() -> str:
 
 
 def load_kf_cursors() -> dict[str, str]:
+    if models.is_enabled():
+        return models.load_kf_cursors()
+
     if not WECOM_KF_CURSOR_FILE.exists():
         return {}
 
@@ -3362,6 +3729,10 @@ def load_kf_cursors() -> dict[str, str]:
 
 
 def save_kf_cursors(cursors: dict[str, str]) -> None:
+    if models.is_enabled():
+        models.save_kf_cursors(cursors)
+        return
+
     WECOM_KF_CURSOR_FILE.write_text(
         json.dumps(cursors, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -3609,7 +3980,7 @@ def handle_photo_order_input(user_id: str, image_bytes: bytes, mime_type: str | 
         answer = (
             "我把照片识别成待确认订单：\n"
             + summary
-            + "\n确认无误请回复“确认”；要修改就直接发修改内容。"
+            + "\n确认无误请回复“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
         )
 
     return ChatResponse(
@@ -3938,14 +4309,35 @@ def api_mark_fetched(request: Request, payload: MarkFetchedRequest) -> dict[str,
     return mark_order_payloads_fetched(payload.ids)
 
 
+@app.post("/api/orders/unmark")
+def api_unmark_orders(request: Request, payload: MarkFetchedRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    return unmark_order_payloads(payload.ids)
+
+
 @app.get("/api/receipts")
 def api_receipts(
     request: Request,
     date: str = Query(...),
+    status: str = Query(default=RECEIPT_STATUS_NEW),
 ) -> dict[str, list[dict[str, Any]]]:
     require_robot_api_token(request)
+    if status not in RECEIPT_API_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be new, fetched, or all")
     normalized_date = validate_iso_date_param(date, "date")
-    return {"receipts": query_receipt_payloads(normalized_date)}
+    return {"receipts": query_receipt_payloads_by_status(normalized_date, status)}
+
+
+@app.post("/api/receipts/mark_fetched")
+def api_mark_receipts_fetched(request: Request, payload: IdsRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    return mark_receipt_payloads_fetched(payload.ids)
+
+
+@app.post("/api/receipts/unmark")
+def api_unmark_receipts(request: Request, payload: IdsRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    return unmark_receipt_payloads(payload.ids)
 
 
 @app.post("/api/orders/import/excel")

@@ -1,0 +1,2 @@
+TABLE = "user_identities"
+

@@ -1,0 +1,2 @@
+TABLE = "product_aliases"
+

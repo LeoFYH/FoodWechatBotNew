@@ -1,0 +1,2 @@
+TABLE = "conversation_messages"
+

@@ -1,5 +1,23 @@
 # FoodWechatBot 订单接入变更总结
 
+## 0. 业务确认意图识别
+
+新增 `services/business_intent.py`，把订单/入库待确认草稿的用户回复意图从 `main.py` 拆到业务服务层。
+
+当前确认逻辑不再只依赖固定“确认”二字：
+
+```text
+确认、对、好、ok、yes、安排、妥了、对 快点吧
+```
+
+这类肯定语义都可以触发保存；规则不确定时，只让 LLM 做 `confirm/modify/reject/chat/unclear` 意图分类，业务保存仍由程序层执行。
+
+保护规则：
+
+- 没有待确认草稿时，不会因为用户说 `ok/yes/好` 就入库。
+- `不对`、`先别`、`不要`、`取消`、`撤回`、`修改` 等优先走拒绝/取消/修改，不会误保存。
+- LLM 分类不直接执行 `cancel/exit` 这类清状态动作，避免误清空草稿。
+
 ## 1. 订单接口加锁
 
 所有 `/api/*` 接口现在都要求 Bearer Token：
@@ -160,6 +178,7 @@ idx_order_entries_status_order_date
 GET /api/orders?status=new&order_date=YYYY-MM-DD
 GET /api/orders?status=fetched&order_date=YYYY-MM-DD
 GET /api/orders?status=all&order_date=YYYY-MM-DD
+POST /api/orders/unmark
 ```
 
 `status=all` 只忽略 new/fetched 状态，但仍然只返回 `confirmed=true` 且 `order_date` 匹配的订单。
@@ -171,6 +190,8 @@ GET /api/orders?status=all&order_date=YYYY-MM-DD
 ```
 
 已 fetched 的 id 重复调用仍算 `succeeded`；不存在的 id 算 `failed`。
+
+`unmark` 把已拉取订单退回 `new`，用于 Web 工具作废本批后重新同步。
 
 ## 6.2 入库模式和产成品入库库
 
@@ -202,6 +223,7 @@ RECEIPT_DB_FILE=receipts.db
 ```text
 id
 date
+status
 created_at
 updated_at
 payload_json
@@ -211,6 +233,9 @@ payload_json
 
 ```text
 GET /api/receipts?date=YYYY-MM-DD
+GET /api/receipts?status=fetched&date=YYYY-MM-DD
+POST /api/receipts/mark_fetched
+POST /api/receipts/unmark
 ```
 
 返回：
@@ -219,7 +244,7 @@ GET /api/receipts?date=YYYY-MM-DD
 { "receipts": [] }
 ```
 
-入库数据不带 `store`，不按门店分组，不调用 `mark_fetched`。
+入库数据不带 `store`，不按门店分组。默认 `status=new` 只返回未被 Web 工具标记已拉取的数据；生成入库单成功后调用 `mark_fetched`，作废本批时调用 `unmark` 退回为未拉取。
 
 ## 7. 配置文件更新
 
@@ -257,6 +282,7 @@ python -m py_compile main.py
 /api/orders 未带 token -> 401
 /api/orders 带 token -> 200
 mark_fetched 正常
+unmark 正常
 ```
 
 订单字段验证：
@@ -269,6 +295,7 @@ created_at 保持消息/入库时间
 patch 无 store -> 拒绝入库
 GET /api/orders?status=all&order_date=... 可返回已 fetched 订单
 GET /api/receipts?date=... 返回独立产成品入库数据，不带 store
+GET /api/receipts?status=fetched&date=... 可重拉已标记入库数据
 ```
 
 ## 9. 修改文件清单

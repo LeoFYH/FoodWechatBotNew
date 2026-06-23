@@ -1,0 +1,2 @@
+TABLE = "store_aliases"
+
