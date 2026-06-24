@@ -140,6 +140,60 @@ class ExcelParsingTests(unittest.TestCase):
         self.assertEqual(payload["items"][1]["code"], "03010001")
         self.assertEqual(payload["items"][1]["qty"], 4)
 
+    def test_excel_wechat_input_creates_confirmation_draft(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["收货门店", "鼓楼店", "订单日期", "2026-06-24"])
+        sheet.append(["商品名称", "订货数量(箱)"])
+        sheet.append(["鲜肉馄饨", 2])
+
+        response = self.main.handle_excel_order_input(
+            "u1",
+            self.workbook_bytes(workbook),
+            "kf:file:test.xlsx",
+        )
+
+        draft = self.main.get_order_draft("u1")
+        self.assertIn("待确认订单", response.answer)
+        self.assertIn("确认", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_ORDER)
+        self.assertEqual(draft["source"], self.main.ORDER_SOURCE_EXCEL)
+        self.assertFalse(draft["confirmed"])
+        self.assertEqual(draft["store"], "鼓楼店")
+        self.assertEqual(draft["items"][0]["name"], "鲜肉馄饨")
+        self.assertEqual(draft["items"][0]["qty"], 2)
+        self.assertEqual(self.main.query_order_payloads(), [])
+
+    def test_wecom_file_sends_processing_message_before_excel_result(self) -> None:
+        sent_messages: list[str] = []
+
+        with patch.object(self.main, "is_duplicate_wecom_kf_message", return_value=False), \
+            patch.object(
+                self.main,
+                "get_wecom_kf_media",
+                return_value=(b"fake-xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "test.xlsx"),
+            ), \
+            patch.object(
+                self.main,
+                "handle_excel_order_input",
+                return_value=self.main.ChatResponse(user_id="u1", answer="解析完成", history_length=0),
+            ), \
+            patch.object(self.main, "send_wecom_kf_text", side_effect=lambda _kf, _user, content: sent_messages.append(content)):
+            self.main.handle_wecom_kf_sync_item(
+                {
+                    "msgid": "m1",
+                    "msgtype": "file",
+                    "open_kfid": "kf1",
+                    "external_userid": "user1",
+                    "file": {"media_id": "media1", "filename": "test.xlsx"},
+                }
+            )
+
+        self.assertGreaterEqual(len(sent_messages), 2)
+        self.assertIn("已收到Excel", sent_messages[0])
+        self.assertIn("正在解析", sent_messages[0])
+        self.assertEqual(sent_messages[-1], "解析完成")
+
 
 if __name__ == "__main__":
     unittest.main()

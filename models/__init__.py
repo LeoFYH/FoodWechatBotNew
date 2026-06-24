@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from . import channel_cursors as pg_channel_cursors
@@ -10,6 +12,12 @@ from . import orders as pg_orders
 from . import production_receipts as pg_production_receipts
 from . import redis_cache
 from .db import database_url, default_tenant_code, is_enabled
+
+logger = logging.getLogger("wechatclaw")
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
 
 
 def redis_url() -> str:
@@ -101,11 +109,35 @@ def save_interview_archive(archive: dict[str, dict[str, Any]]) -> None:
 
 def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
     _require_redis()
+    started_at = time.perf_counter()
     redis_cache.record_operation("orders.insert", {"payload": payload})
+    redis_record_ms = _elapsed_ms(started_at)
+
+    pg_started_at = time.perf_counter()
     result = pg_orders.insert_order_payload(payload)
+    pg_ms = _elapsed_ms(pg_started_at)
+
+    invalidate_started_at = time.perf_counter()
     redis_cache.delete_pattern(_order_query_pattern())
+    redis_invalidate_ms = _elapsed_ms(invalidate_started_at)
+
+    redis_set_ms = 0
     if result.get("id") is not None:
+        set_started_at = time.perf_counter()
         redis_cache.set_json(redis_cache.make_key("orders", "id", result["id"]), result)
+        redis_set_ms = _elapsed_ms(set_started_at)
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    logger.info(
+        "storage_order_insert_done order_id=%s lines=%s redis_record_ms=%s pg_ms=%s "
+        "redis_invalidate_ms=%s redis_set_ms=%s total_ms=%s",
+        result.get("id"),
+        len(items),
+        redis_record_ms,
+        pg_ms,
+        redis_invalidate_ms,
+        redis_set_ms,
+        _elapsed_ms(started_at),
+    )
     return result
 
 

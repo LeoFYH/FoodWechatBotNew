@@ -9,6 +9,8 @@ from typing import Any, Callable, TypeVar
 
 DEFAULT_CACHE_TTL_SECONDS = 300
 DEFAULT_STREAM_MAXLEN = 10000
+DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS = 5
+DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 5
 
 T = TypeVar("T")
 _MISSING = object()
@@ -19,6 +21,17 @@ def _get_bool_env(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(parsed, 1)
 
 
 def redis_url() -> str:
@@ -62,6 +75,17 @@ def stream_maxlen() -> int:
     return max(value, 100)
 
 
+def socket_timeout_seconds() -> int:
+    return _get_int_env("REDIS_SOCKET_TIMEOUT_SECONDS", DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS)
+
+
+def socket_connect_timeout_seconds() -> int:
+    return _get_int_env(
+        "REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS",
+        DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+    )
+
+
 def is_enabled() -> bool:
     return cache_enabled() and bool(redis_url())
 
@@ -73,7 +97,12 @@ def _load_redis_client():
         raise RuntimeError(
             "PostgreSQL backend requires Redis cache. Run: python3 -m pip install -r requirements.txt"
         ) from exc
-    return redis.Redis.from_url(redis_url(), decode_responses=True)
+    return redis.Redis.from_url(
+        redis_url(),
+        decode_responses=True,
+        socket_timeout=socket_timeout_seconds(),
+        socket_connect_timeout=socket_connect_timeout_seconds(),
+    )
 
 
 def client():

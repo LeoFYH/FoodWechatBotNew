@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from .constants import (
@@ -18,6 +20,11 @@ from .utils import as_date, as_datetime, legacy_fields, required_date
 
 
 TABLE = "orders"
+logger = logging.getLogger("wechatclaw")
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
 
 
 def row_to_order_payload(conn: Any, row: dict[str, Any]) -> dict[str, Any]:
@@ -80,9 +87,15 @@ def _select_order_by_id(conn: Any, order_id: int) -> dict[str, Any] | None:
 def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
     payload = dict(payload)
     legacy_source, legacy_id = legacy_fields(payload)
+    started_at = time.perf_counter()
+    line_count = len(payload.get("items") or []) if isinstance(payload.get("items"), list) else 0
 
     with connection() as conn:
+        tenant_started_at = time.perf_counter()
         tenant_id = ensure_tenant(conn)
+        tenant_ms = _elapsed_ms(tenant_started_at)
+
+        dedupe_started_at = time.perf_counter()
         if legacy_source and legacy_id is not None:
             existing = conn.execute(
                 """
@@ -95,13 +108,26 @@ def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if existing:
                 found = _select_order_by_id(conn, int(existing["id"]))
                 if found:
+                    logger.info(
+                        "pg_order_insert_dedupe_hit order_id=%s lines=%s tenant_ms=%s dedupe_ms=%s total_ms=%s",
+                        found.get("id"),
+                        line_count,
+                        tenant_ms,
+                        _elapsed_ms(dedupe_started_at),
+                        _elapsed_ms(started_at),
+                    )
                     return found
+        dedupe_ms = _elapsed_ms(dedupe_started_at)
 
+        store_started_at = time.perf_counter()
         store_id = ensure_store(conn, tenant_id, str(payload.get("store") or ""))
+        store_ms = _elapsed_ms(store_started_at)
         confirmed = bool(payload.get("confirmed"))
         created_at = as_datetime(payload.get("created_at"))
         order_date = required_date(payload.get("order_date"))
         deliver_date = as_date(payload.get("deliver_date"))
+
+        order_started_at = time.perf_counter()
         row = conn.execute(
             """
             insert into orders (
@@ -141,12 +167,31 @@ def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
             ),
         ).fetchone()
         order_id = int(row["id"])
+        order_ms = _elapsed_ms(order_started_at)
 
+        items_started_at = time.perf_counter()
         for line_no, item in enumerate(payload.get("items") or [], start=1):
             if isinstance(item, dict):
                 insert_order_item(conn, tenant_id, order_id, line_no, item)
+        items_ms = _elapsed_ms(items_started_at)
 
-        return _select_order_by_id(conn, order_id) or {**payload, "id": order_id}
+        select_started_at = time.perf_counter()
+        result = _select_order_by_id(conn, order_id) or {**payload, "id": order_id}
+        select_ms = _elapsed_ms(select_started_at)
+        logger.info(
+            "pg_order_insert_done order_id=%s lines=%s tenant_ms=%s dedupe_ms=%s store_ms=%s "
+            "order_ms=%s items_ms=%s select_ms=%s total_ms=%s",
+            order_id,
+            line_count,
+            tenant_ms,
+            dedupe_ms,
+            store_ms,
+            order_ms,
+            items_ms,
+            select_ms,
+            _elapsed_ms(started_at),
+        )
+        return result
 
 
 def query_order_payloads(
