@@ -182,6 +182,17 @@ class ExcelParsingTests(unittest.TestCase):
         self.assertEqual(header_map[0], "name")
         self.assertEqual(header_map[1], "qty")
 
+    def test_excel_candidate_columns_ignores_empty_columns_between_sparse_values(self) -> None:
+        header = ("商品名称", "订货数量", *([None] * 297), "备注")
+        data_rows = [
+            ("鲜肉馄饨", 3),
+            ("虾肉馄饨", 2),
+        ]
+
+        columns = self.main.excel_candidate_columns(header, data_rows)
+
+        self.assertEqual(columns, [0, 1, 299])
+
     def test_excel_wechat_input_creates_confirmation_draft(self) -> None:
         workbook = Workbook()
         sheet = workbook.active

@@ -2801,11 +2801,13 @@ def infer_excel_code_column(rows: list[tuple[Any, ...]], header_index: int, head
     return best_index if best_score >= 2 else None
 
 
-def excel_candidate_columns(row: tuple[Any, ...], data_rows: list[tuple[Any, ...]]) -> range:
-    max_width = len(row)
-    for data_row in data_rows[:80]:
-        max_width = max(max_width, len(data_row))
-    return range(max_width)
+def excel_candidate_columns(row: tuple[Any, ...], data_rows: list[tuple[Any, ...]]) -> list[int]:
+    candidates: set[int] = set()
+    for candidate_row in [row, *data_rows[:80]]:
+        for index, value in enumerate(candidate_row):
+            if clean_order_value(value):
+                candidates.add(index)
+    return sorted(candidates)
 
 
 def score_excel_header_candidate(rows: list[tuple[Any, ...]], header_index: int) -> tuple[int, dict[int, str], int]:
