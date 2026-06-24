@@ -80,6 +80,62 @@ class ExcelParsingTests(unittest.TestCase):
         self.assertEqual(payloads[0]["items"][0]["qty"], 6)
         self.assertEqual(payloads[0]["items"][0]["unit"], "袋")
 
+    def test_parse_unknown_headers_by_following_data_rows(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["门店", "鼓楼店"])
+        sheet.append(["货品信息", "采购数"])
+        sheet.append(["香菇馄饨", 3])
+        sheet.append(["牛肉馄饨", 5])
+
+        payloads = self.main.parse_excel_order_payloads(self.workbook_bytes(workbook), "fuzzy.xlsx")
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["store"], "鼓楼店")
+        self.assertEqual([item["name"] for item in payloads[0]["items"]], ["香菇馄饨", "牛肉馄饨"])
+        self.assertEqual([item["qty"] for item in payloads[0]["items"]], [3, 5])
+
+    def test_skip_header_like_sheet_without_item_rows(self) -> None:
+        workbook = Workbook()
+        summary_sheet = workbook.active
+        summary_sheet.title = "汇总"
+        summary_sheet.append(["商品名称", "订货数量"])
+        summary_sheet.append(["说明", None])
+        order_sheet = workbook.create_sheet("鼓楼订货")
+        order_sheet.append(["非标准品项", "要货数"])
+        order_sheet.append(["虾仁馄饨", 6])
+
+        payloads = self.main.parse_excel_order_payloads(self.workbook_bytes(workbook), "skip-empty.xlsx")
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["items"][0]["name"], "虾仁馄饨")
+        self.assertEqual(payloads[0]["items"][0]["qty"], 6)
+
+    def test_parse_catalog_order_form_with_sparse_quantities(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "鼓楼"
+        sheet.append(["馄饨侯（鼓楼）店产品订货单"])
+        sheet.append(["订货日期：", None, None, 46193, None, None, None, "订货人：", "周凯"])
+        sheet.append(["到货日期：", None, None, 46194])
+        sheet.append(["序号", "类别", None, "原料名称", "规格", "单位", "单价", "订货数量"])
+        sheet.append([1, "馄饨", "05020093", "鸡汤鲜肉馄饨", "260g/袋*25袋", "箱", 267.32, None])
+        sheet.append([2, "馄饨", "05020094", "鸡汤虾肉馄饨", "500g/袋*12袋", "箱", 399.11, 1])
+        sheet.append([3, "面条类", "03010001", "碱面条", None, "kg", 11.96, 4])
+
+        payloads = self.main.parse_excel_order_payloads(self.workbook_bytes(workbook), "catalog.xlsx")
+
+        self.assertEqual(len(payloads), 1)
+        payload = payloads[0]
+        self.assertEqual(payload["store"], "鼓楼")
+        self.assertEqual(payload["order_date"], "2026-06-20")
+        self.assertEqual(payload["deliver_date"], "2026-06-21")
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertEqual(payload["items"][0]["code"], "05020094")
+        self.assertEqual(payload["items"][0]["name"], "鸡汤虾肉馄饨")
+        self.assertEqual(payload["items"][1]["code"], "03010001")
+        self.assertEqual(payload["items"][1]["qty"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

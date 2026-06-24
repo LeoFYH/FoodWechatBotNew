@@ -26,6 +26,7 @@ from Crypto.Cipher import AES
 import httpx
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils.datetime import from_excel
 from openpyxl.utils import get_column_letter
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -1907,6 +1908,13 @@ def normalize_date_text(value: Any) -> str:
         return ""
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and 20000 <= float(value) <= 80000:
+        try:
+            return from_excel(value).date().isoformat()
+        except (TypeError, ValueError):
+            pass
     return clean_order_value(value)
 
 
@@ -2456,27 +2464,221 @@ def excel_header_units(row: tuple[Any, ...], header_map: dict[int, str]) -> dict
     return units
 
 
+def excel_row_has_value(row: tuple[Any, ...]) -> bool:
+    return any(clean_order_value(value) for value in row)
+
+
+def excel_cell_value(row: tuple[Any, ...], index: int) -> Any:
+    return row[index] if index < len(row) else None
+
+
+def excel_label_header_map(row: tuple[Any, ...]) -> dict[int, str]:
+    header_map: dict[int, str] = {}
+    for column_index, value in enumerate(row):
+        key = excel_header_key(value)
+        if key and key not in header_map.values():
+            header_map[column_index] = key
+    return header_map
+
+
+def is_excel_date_like_value(value: Any) -> bool:
+    if isinstance(value, (datetime, date)):
+        return True
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 20000 <= float(value) <= 80000
+
+
+def is_excel_unit_text(value: Any) -> bool:
+    text = clean_order_value(value)
+    if not text or len(text) > 8:
+        return False
+    normalized = normalize_excel_header(text)
+    return normalized in {
+        "箱",
+        "件",
+        "袋",
+        "盒",
+        "包",
+        "斤",
+        "公斤",
+        "kg",
+        "份",
+        "个",
+        "瓶",
+        "桶",
+        "条",
+        "只",
+        "套",
+    }
+
+
+def is_excel_summary_name(value: Any) -> bool:
+    normalized = normalize_excel_header(value)
+    return normalized in {"合计", "小计", "总计", "共计", "合计数量", "数量合计"}
+
+
+def looks_like_excel_item_code(value: Any) -> bool:
+    text = clean_order_value(value)
+    if not text or text == "#N/A":
+        return bool(text)
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 4:
+        return False
+    if not re.search(r"\d", compact):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9#/_-]+", compact))
+
+
+def looks_like_excel_item_name(value: Any) -> bool:
+    text = clean_order_value(value)
+    if not text or len(re.sub(r"\s+", "", text)) < 2:
+        return False
+    if is_excel_summary_name(text) or is_excel_metadata_label(text):
+        return False
+    if excel_header_key(text) or looks_like_excel_item_code(text) or is_excel_unit_text(text):
+        return False
+    if normalize_number(text) is not None and re.fullmatch(r"[-+]?[\d,]+(?:\.\d+)?", text):
+        return False
+    return True
+
+
+def excel_quantity_number(value: Any) -> int | float | None:
+    if is_excel_date_like_value(value):
+        return None
+    if looks_like_excel_item_code(value):
+        return None
+    return normalize_number(value)
+
+
+def infer_excel_code_column(rows: list[tuple[Any, ...]], header_index: int, header_map: dict[int, str]) -> int | None:
+    if "code" in header_map.values() or "name" not in header_map.values():
+        return None
+    name_index = next(index for index, key in header_map.items() if key == "name")
+    candidates = [
+        index
+        for index in range(max(0, name_index - 3), name_index)
+        if index not in header_map
+    ]
+    best_index: int | None = None
+    best_score = 0
+    for index in candidates:
+        score = 0
+        for row in rows[header_index + 1 : header_index + 25]:
+            if index < len(row) and looks_like_excel_item_code(row[index]):
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return best_index if best_score >= 2 else None
+
+
+def excel_candidate_columns(row: tuple[Any, ...], data_rows: list[tuple[Any, ...]]) -> range:
+    max_width = len(row)
+    for data_row in data_rows[:80]:
+        max_width = max(max_width, len(data_row))
+    return range(max_width)
+
+
+def score_excel_header_candidate(rows: list[tuple[Any, ...]], header_index: int) -> tuple[int, dict[int, str], int]:
+    header_row = rows[header_index]
+    label_map = excel_label_header_map(header_row)
+    data_rows = [row for row in rows[header_index + 1 :] if excel_row_has_value(row)]
+    if not data_rows:
+        return 0, {}, 0
+
+    bad_name_keys = {"store", "order_no", "orderer", "order_date", "deliver_date", "code", "unit", "qty", "price", "category"}
+    bad_qty_keys = {"store", "order_no", "orderer", "order_date", "deliver_date", "code", "name", "spec", "unit", "price", "category"}
+    columns = list(excel_candidate_columns(header_row, data_rows))
+    best_score = 0
+    best_map: dict[int, str] = {}
+    best_item_count = 0
+
+    for name_index in columns:
+        name_key = label_map.get(name_index)
+        if name_key in bad_name_keys:
+            continue
+        for qty_index in columns:
+            if qty_index == name_index:
+                continue
+            qty_key = label_map.get(qty_index)
+            if qty_key in bad_qty_keys:
+                continue
+
+            hits: list[tuple[int, str, int | float]] = []
+            integer_qty_count = 0
+            decimal_qty_count = 0
+            blank_qty_count = 0
+            for offset, data_row in enumerate(data_rows):
+                qty_number = excel_quantity_number(excel_cell_value(data_row, qty_index))
+                name_value = excel_cell_value(data_row, name_index)
+                if qty_number is None:
+                    if looks_like_excel_item_name(name_value):
+                        blank_qty_count += 1
+                    continue
+                if not looks_like_excel_item_name(name_value):
+                    continue
+                name_text = clean_order_value(name_value)
+                hits.append((offset, name_text, qty_number))
+                if isinstance(qty_number, float) and not qty_number.is_integer():
+                    decimal_qty_count += 1
+                else:
+                    integer_qty_count += 1
+
+            if not hits:
+                continue
+
+            first_hit_offset = hits[0][0]
+            immediate_hit_count = sum(1 for offset, _, _ in hits if offset <= 5)
+            if immediate_hit_count == 0 and len(hits) < 2:
+                continue
+
+            unique_names = len({name for _, name, _ in hits})
+            avg_name_length = sum(len(name) for _, name, _ in hits) / len(hits)
+            score = len(hits) * 20
+            score += immediate_hit_count * 8
+            score += min(unique_names, 8) * 3
+            score += min(int(avg_name_length), 12)
+            score += min(integer_qty_count, 8) * 2
+            score += min(blank_qty_count, 8)
+            if qty_index > name_index:
+                score += 6
+            if label_map.get(name_index) == "name":
+                score += 40
+            if label_map.get(qty_index) == "qty":
+                score += 45
+            score += len(label_map) * 2
+            score -= first_hit_offset * 3
+            score -= decimal_qty_count * 3
+
+            if score > best_score:
+                candidate_map = dict(label_map)
+                candidate_map[name_index] = "name"
+                candidate_map[qty_index] = "qty"
+                best_score = score
+                best_map = candidate_map
+                best_item_count = len(hits)
+
+    if best_score < 24:
+        return 0, {}, 0
+    return best_score, best_map, best_item_count
+
+
 def find_excel_header_row(rows: list[tuple[Any, ...]]) -> tuple[int, dict[int, str]]:
     best_index = -1
     best_map: dict[int, str] = {}
     best_score = 0
-    best_has_required = False
-    for index, row in enumerate(rows[:30]):
-        header_map: dict[int, str] = {}
-        for column_index, value in enumerate(row):
-            key = excel_header_key(value)
-            if key and key not in header_map.values():
-                header_map[column_index] = key
-        score = len(header_map)
-        has_required = "name" in header_map.values() and "qty" in header_map.values()
-        if (has_required and not best_has_required) or (has_required == best_has_required and score > best_score):
+    best_item_count = 0
+    for index, row in enumerate(rows):
+        if not excel_row_has_value(row):
+            continue
+        score, header_map, item_count = score_excel_header_candidate(rows, index)
+        if score > best_score:
             best_index = index
             best_map = header_map
             best_score = score
-            best_has_required = has_required
+            best_item_count = item_count
 
-    if best_score < 2 or not best_has_required:
-        raise ValueError("Excel header row not found; expected product name and quantity columns")
+    if best_index < 0 or not best_map or best_item_count < 1:
+        raise ValueError("Excel header row not found; expected item rows after a header row")
     return best_index, best_map
 
 
@@ -2490,6 +2692,30 @@ def is_excel_metadata_label(value: Any) -> bool:
     return False
 
 
+def next_excel_metadata_value(cells: list[Any], index: int) -> Any:
+    for value in cells[index + 1 :]:
+        if not clean_order_value(value):
+            continue
+        if is_excel_metadata_label(value):
+            return None
+        return value
+    return None
+
+
+def extract_store_from_excel_title(text: str) -> str:
+    cleaned = clean_order_value(text)
+    patterns = [
+        r"馄饨侯[（(]([^）)]+)[）)]店?产品?订货单",
+        r"馄饨侯(.+?)店产品?订货单",
+        r"(.+?)店产品?订货单",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            return clean_export_value(match.group(1))
+    return ""
+
+
 def extract_excel_metadata(rows: list[tuple[Any, ...]], header_index: int) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     for row in rows[: max(header_index, 1)]:
@@ -2498,14 +2724,18 @@ def extract_excel_metadata(rows: list[tuple[Any, ...]], header_index: int) -> di
             text = clean_order_value(value)
             if not text:
                 continue
+            if not metadata.get("store"):
+                title_store = extract_store_from_excel_title(text)
+                if title_store:
+                    metadata["store"] = title_store
             for field, labels in EXCEL_METADATA_LABELS.items():
                 if metadata.get(field):
                     continue
                 for label in labels:
                     label_text = normalize_excel_header(label)
                     value_text = normalize_excel_header(text)
-                    if value_text == label_text and index + 1 < len(cells) and not is_excel_metadata_label(cells[index + 1]):
-                        metadata[field] = cells[index + 1]
+                    if value_text == label_text:
+                        metadata[field] = next_excel_metadata_value(cells, index)
                     else:
                         inline_match = re.match(rf"^\s*{re.escape(label)}\s*[：:]\s*(.+?)\s*$", text)
                         if inline_match:
@@ -2520,6 +2750,28 @@ def row_value_by_header(row: tuple[Any, ...], header_map: dict[int, str], field:
     return None
 
 
+def finalize_excel_header_map(rows: list[tuple[Any, ...]], header_index: int, header_map: dict[int, str]) -> dict[int, str]:
+    finalized = dict(header_map)
+    inferred_code_column = infer_excel_code_column(rows, header_index, finalized)
+    if inferred_code_column is not None:
+        finalized[inferred_code_column] = "code"
+    return finalized
+
+
+def find_excel_order_tables(workbook: Any) -> list[tuple[str, list[tuple[Any, ...]], int, dict[int, str]]]:
+    tables: list[tuple[str, list[tuple[Any, ...]], int, dict[int, str]]] = []
+    for sheet in workbook.worksheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            continue
+        try:
+            header_index, header_map = find_excel_header_row(rows)
+        except ValueError:
+            continue
+        tables.append((sheet.title, rows, header_index, finalize_excel_header_map(rows, header_index, header_map)))
+    return tables
+
+
 def find_excel_order_rows(workbook: Any) -> tuple[list[tuple[Any, ...]], int, dict[int, str]]:
     last_error: ValueError | None = None
     for sheet in workbook.worksheets:
@@ -2531,7 +2783,7 @@ def find_excel_order_rows(workbook: Any) -> tuple[list[tuple[Any, ...]], int, di
         except ValueError as exc:
             last_error = exc
             continue
-        return rows, header_index, header_map
+        return rows, header_index, finalize_excel_header_map(rows, header_index, header_map)
     if last_error:
         raise last_error
     raise ValueError("Excel file is empty")
@@ -2539,56 +2791,64 @@ def find_excel_order_rows(workbook: Any) -> tuple[list[tuple[Any, ...]], int, di
 
 def parse_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str, Any]]:
     workbook = load_workbook(BytesIO(file_bytes), data_only=True)
-    rows, header_index, header_map = find_excel_order_rows(workbook)
-    metadata = extract_excel_metadata(rows, header_index)
-    header_units = excel_header_units(rows[header_index], header_map)
+    tables = find_excel_order_tables(workbook)
+    if not tables:
+        find_excel_order_rows(workbook)
     grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
 
-    for row in rows[header_index + 1 :]:
-        item = {
-            "code": row_value_by_header(row, header_map, "code"),
-            "name": row_value_by_header(row, header_map, "name"),
-            "spec": row_value_by_header(row, header_map, "spec"),
-            "unit": row_value_by_header(row, header_map, "unit") or header_units.get("qty"),
-            "qty": row_value_by_header(row, header_map, "qty"),
-            "price": row_value_by_header(row, header_map, "price"),
-            "category": row_value_by_header(row, header_map, "category"),
-        }
-        normalized_item = normalize_base_item(item)
-        if not normalized_item.get("name") and normalized_item.get("qty") is None:
-            continue
+    for sheet_title, rows, header_index, header_map in tables:
+        metadata = extract_excel_metadata(rows, header_index)
+        if not metadata.get("store"):
+            metadata["store"] = extract_store_from_excel_title(sheet_title)
+        header_units = excel_header_units(rows[header_index], header_map)
 
-        store = row_value_by_header(row, header_map, "store") or metadata.get("store") or ""
-        order_no = row_value_by_header(row, header_map, "order_no") or metadata.get("order_no") or ""
-        orderer = row_value_by_header(row, header_map, "orderer") or metadata.get("orderer") or ""
-        order_date = row_value_by_header(row, header_map, "order_date") or metadata.get("order_date") or ""
-        deliver_date = row_value_by_header(row, header_map, "deliver_date") or metadata.get("deliver_date") or ""
+        for row in rows[header_index + 1 :]:
+            item = {
+                "code": row_value_by_header(row, header_map, "code"),
+                "name": row_value_by_header(row, header_map, "name"),
+                "spec": row_value_by_header(row, header_map, "spec"),
+                "unit": row_value_by_header(row, header_map, "unit") or header_units.get("qty"),
+                "qty": row_value_by_header(row, header_map, "qty"),
+                "price": row_value_by_header(row, header_map, "price"),
+                "category": row_value_by_header(row, header_map, "category"),
+            }
+            normalized_item = normalize_base_item(item)
+            if not normalized_item.get("name") or normalized_item.get("qty") is None:
+                continue
+            if is_excel_summary_name(normalized_item.get("name")):
+                continue
 
-        key = (
-            clean_order_value(store),
-            clean_order_value(order_no),
-            clean_order_value(orderer),
-            normalize_order_date_text(order_date),
-            normalize_date_text(deliver_date),
-        )
-        payload = grouped.setdefault(
-            key,
-            {
-                "kind": ORDER_KIND_BASE,
-                "source": ORDER_SOURCE_EXCEL,
-                "store": store,
-                "order_no": order_no,
-                "orderer": orderer,
-                "order_date": order_date,
-                "deliver_date": deliver_date,
-                "items": [],
-                "confirmed": True,
-                "status": ORDER_STATUS_NEW,
-                "raw_ref": raw_ref,
-                "created_at": now_iso(),
-            },
-        )
-        payload["items"].append(normalized_item)
+            store = row_value_by_header(row, header_map, "store") or metadata.get("store") or ""
+            order_no = row_value_by_header(row, header_map, "order_no") or metadata.get("order_no") or ""
+            orderer = row_value_by_header(row, header_map, "orderer") or metadata.get("orderer") or ""
+            order_date = row_value_by_header(row, header_map, "order_date") or metadata.get("order_date") or ""
+            deliver_date = row_value_by_header(row, header_map, "deliver_date") or metadata.get("deliver_date") or ""
+
+            key = (
+                clean_order_value(store),
+                clean_order_value(order_no),
+                clean_order_value(orderer),
+                normalize_order_date_text(order_date),
+                normalize_date_text(deliver_date),
+            )
+            payload = grouped.setdefault(
+                key,
+                {
+                    "kind": ORDER_KIND_BASE,
+                    "source": ORDER_SOURCE_EXCEL,
+                    "store": store,
+                    "order_no": order_no,
+                    "orderer": orderer,
+                    "order_date": order_date,
+                    "deliver_date": deliver_date,
+                    "items": [],
+                    "confirmed": True,
+                    "status": ORDER_STATUS_NEW,
+                    "raw_ref": raw_ref,
+                    "created_at": now_iso(),
+                },
+            )
+            payload["items"].append(normalized_item)
 
     payloads = [normalize_order_payload(payload) for payload in grouped.values()]
     if not payloads:
