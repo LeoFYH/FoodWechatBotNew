@@ -10,6 +10,35 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 
+class FakeCell:
+    def __init__(self, row: int, column: int, value):
+        self.row = row
+        self.column = column
+        self.value = value
+
+
+class SparseDimensionSheet:
+    title = "订单"
+
+    def __init__(self):
+        self._cells = {
+            (1, 1): FakeCell(1, 1, "商品名称"),
+            (1, 2): FakeCell(1, 2, "订货数量"),
+            (2, 1): FakeCell(2, 1, "鲜肉馄饨"),
+            (2, 2): FakeCell(2, 2, 3),
+        }
+        self.max_row = 1_048_576
+        self.max_column = 16
+
+    def iter_rows(self, *args, **kwargs):
+        raise AssertionError("should not iterate declared worksheet dimension")
+
+
+class FakeWorkbook:
+    def __init__(self, sheets):
+        self.worksheets = sheets
+
+
 class ExcelParsingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -139,6 +168,19 @@ class ExcelParsingTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["name"], "鸡汤虾肉馄饨")
         self.assertEqual(payload["items"][1]["code"], "03010001")
         self.assertEqual(payload["items"][1]["qty"], 4)
+
+    def test_find_excel_order_tables_uses_existing_cells_not_declared_dimension(self) -> None:
+        workbook = FakeWorkbook([SparseDimensionSheet()])
+
+        tables = self.main.find_excel_order_tables(workbook)
+
+        self.assertEqual(len(tables), 1)
+        _title, rows, header_index, header_map = tables[0]
+        self.assertEqual(header_index, 0)
+        self.assertEqual(rows[1][0], "鲜肉馄饨")
+        self.assertEqual(rows[1][1], 3)
+        self.assertEqual(header_map[0], "name")
+        self.assertEqual(header_map[1], "qty")
 
     def test_excel_wechat_input_creates_confirmation_draft(self) -> None:
         workbook = Workbook()

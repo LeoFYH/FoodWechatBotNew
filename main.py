@@ -65,6 +65,8 @@ DEFAULT_ORDER_DB_FILE = "orders.db"
 DEFAULT_RECEIPT_DB_FILE = "receipts.db"
 DEFAULT_VISION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_VISION_MODEL = "qwen3-vl-plus"
+EXCEL_MAX_SCAN_ROWS = 500
+EXCEL_MAX_SCAN_COLUMNS = 80
 APP_BUILD_LABEL = os.getenv("APP_BUILD_LABEL", "excel-diagnostics-2026-06-24")
 
 
@@ -2986,10 +2988,44 @@ def finalize_excel_header_map(rows: list[tuple[Any, ...]], header_index: int, he
     return finalized
 
 
+def worksheet_value_rows(sheet: Any) -> list[tuple[Any, ...]]:
+    cells = getattr(sheet, "_cells", None)
+    if isinstance(cells, dict) and cells:
+        valued_cells: list[tuple[int, int, Any]] = []
+        for cell in cells.values():
+            value = getattr(cell, "value", None)
+            if value is None:
+                continue
+            row_index = getattr(cell, "row", None)
+            column_index = getattr(cell, "column", None)
+            if not isinstance(row_index, int) or not isinstance(column_index, int):
+                continue
+            valued_cells.append((row_index, column_index, value))
+
+        if not valued_cells:
+            return []
+
+        min_row = min(row for row, _column, _value in valued_cells)
+        max_row = max(row for row, _column, _value in valued_cells)
+        min_column = min(column for _row, column, _value in valued_cells)
+        max_column = max(column for _row, column, _value in valued_cells)
+        rows: list[list[Any]] = [
+            [None] * (max_column - min_column + 1)
+            for _ in range(max_row - min_row + 1)
+        ]
+        for row_index, column_index, value in valued_cells:
+            rows[row_index - min_row][column_index - min_column] = value
+        return [tuple(row) for row in rows]
+
+    max_row = min(int(getattr(sheet, "max_row", EXCEL_MAX_SCAN_ROWS) or EXCEL_MAX_SCAN_ROWS), EXCEL_MAX_SCAN_ROWS)
+    max_column = min(int(getattr(sheet, "max_column", EXCEL_MAX_SCAN_COLUMNS) or EXCEL_MAX_SCAN_COLUMNS), EXCEL_MAX_SCAN_COLUMNS)
+    return list(sheet.iter_rows(max_row=max_row, max_col=max_column, values_only=True))
+
+
 def find_excel_order_tables(workbook: Any) -> list[tuple[str, list[tuple[Any, ...]], int, dict[int, str]]]:
     tables: list[tuple[str, list[tuple[Any, ...]], int, dict[int, str]]] = []
     for sheet in workbook.worksheets:
-        rows = list(sheet.iter_rows(values_only=True))
+        rows = worksheet_value_rows(sheet)
         if not rows:
             continue
         try:
@@ -3003,7 +3039,7 @@ def find_excel_order_tables(workbook: Any) -> list[tuple[str, list[tuple[Any, ..
 def find_excel_order_rows(workbook: Any) -> tuple[list[tuple[Any, ...]], int, dict[int, str]]:
     last_error: ValueError | None = None
     for sheet in workbook.worksheets:
-        rows = list(sheet.iter_rows(values_only=True))
+        rows = worksheet_value_rows(sheet)
         if not rows:
             continue
         try:
@@ -3019,10 +3055,27 @@ def find_excel_order_rows(workbook: Any) -> tuple[list[tuple[Any, ...]], int, di
 
 def parse_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str, Any]]:
     ensure_excel_file_content(file_bytes)
+    started_at = time.perf_counter()
     workbook = load_workbook(BytesIO(file_bytes), data_only=True)
+    load_ms = int((time.perf_counter() - started_at) * 1000)
+    logger.info(
+        "excel_workbook_loaded raw_ref=%s size=%s sheets=%s elapsed_ms=%s",
+        raw_ref,
+        len(file_bytes),
+        len(workbook.worksheets),
+        load_ms,
+    )
+    scan_started_at = time.perf_counter()
     tables = find_excel_order_tables(workbook)
     if not tables:
         find_excel_order_rows(workbook)
+    logger.info(
+        "excel_order_tables_scanned raw_ref=%s sheets=%s tables=%s elapsed_ms=%s",
+        raw_ref,
+        len(workbook.worksheets),
+        len(tables),
+        int((time.perf_counter() - scan_started_at) * 1000),
+    )
     grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
 
     for sheet_title, rows, header_index, header_map in tables:
