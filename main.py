@@ -10,6 +10,7 @@ import re
 import socket
 import sqlite3
 import struct
+import sys
 import time
 import traceback
 import xml.etree.ElementTree as ET
@@ -64,6 +65,7 @@ DEFAULT_ORDER_DB_FILE = "orders.db"
 DEFAULT_RECEIPT_DB_FILE = "receipts.db"
 DEFAULT_VISION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_VISION_MODEL = "qwen3-vl-plus"
+APP_BUILD_LABEL = os.getenv("APP_BUILD_LABEL", "excel-diagnostics-2026-06-24")
 
 
 def get_int_env(name: str, default: int) -> int:
@@ -102,11 +104,21 @@ def load_system_prompt() -> str:
     return os.getenv("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
 
 
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    format=LOG_FORMAT,
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger("wechatclaw")
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+log_file = os.getenv("LOG_FILE")
+if log_file:
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logger.addHandler(file_handler)
 
 app = FastAPI(title="WechatClaw Phase 0.5 AI Backend MVP")
 
@@ -3279,6 +3291,14 @@ async def interview_archive_sweeper() -> None:
 
 @app.on_event("startup")
 async def start_interview_archive_sweeper() -> None:
+    logger.warning(
+        "foodwechatbot_startup build=%s file=%s cwd=%s pid=%s database_backend=%s",
+        APP_BUILD_LABEL,
+        Path(__file__).resolve(),
+        Path.cwd(),
+        os.getpid(),
+        os.getenv("DATABASE_BACKEND", "sqlite"),
+    )
     asyncio.create_task(interview_archive_sweeper())
 
 
@@ -4886,7 +4906,7 @@ def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
             else:
                 answer = handle_photo_order_input(session_id, media_bytes, content_type, raw_ref).answer
         except Exception as exc:
-            logger.warning("wecom_kf_image_order_failed msg_id=%s media_id=%s error=%s", msg_id, media_id, exc)
+            logger.exception("wecom_kf_image_order_failed msg_id=%s media_id=%s error=%s", msg_id, media_id, exc)
             answer = "这张图片处理失败了，请稍后再试，或直接用文字发送门店、商品和数量。"
         send_wecom_kf_text(open_kfid, external_userid, answer)
         return
@@ -4914,7 +4934,7 @@ def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
             else:
                 answer = handle_excel_order_input(session_id, media_bytes, raw_ref=f"{raw_ref}:{filename}").answer
         except Exception as exc:
-            logger.warning("wecom_kf_file_order_failed msg_id=%s media_id=%s error=%s", msg_id, media_id, exc)
+            logger.exception("wecom_kf_file_order_failed msg_id=%s media_id=%s error=%s", msg_id, media_id, exc)
             answer = "这个文件处理失败了。请确认是标准 Excel 订单表后重发。"
         send_wecom_kf_text(open_kfid, external_userid, answer)
         return
@@ -4970,13 +4990,26 @@ def process_wecom_kf_event(event: WecomKfEvent) -> None:
         logger.exception("wecom_kf_process_failed open_kfid=%s error=%s", event.open_kfid, exc)
 
 
+def request_client_host(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
+def request_query_keys(request: Request) -> str:
+    return ",".join(sorted(request.query_params.keys()))
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "build": APP_BUILD_LABEL}
 
 
 @app.get("/wecom/callback")
 async def wecom_verify(request: Request):
+    logger.info(
+        "wecom_verify_hit client=%s query_keys=%s",
+        request_client_host(request),
+        request_query_keys(request),
+    )
     msg_signature = require_query_param(request, "msg_signature")
     timestamp = require_query_param(request, "timestamp")
     nonce = require_query_param(request, "nonce")
@@ -5000,10 +5033,16 @@ async def wecom_verify(request: Request):
 
 @app.post("/wecom/callback")
 async def wecom_callback(request: Request):
+    encrypted_body = await request.body()
+    logger.info(
+        "wecom_callback_hit client=%s query_keys=%s body_bytes=%s",
+        request_client_host(request),
+        request_query_keys(request),
+        len(encrypted_body),
+    )
     msg_signature = require_query_param(request, "msg_signature")
     timestamp = require_query_param(request, "timestamp")
     nonce = require_query_param(request, "nonce")
-    encrypted_body = await request.body()
 
     ret, plain_xml = get_wecom_crypto().DecryptMsg(
         encrypted_body,
@@ -5041,6 +5080,11 @@ async def wecom_callback(request: Request):
 
 @app.get("/wecom/kf/callback")
 async def wecom_kf_verify(request: Request):
+    logger.info(
+        "wecom_kf_verify_hit client=%s query_keys=%s",
+        request_client_host(request),
+        request_query_keys(request),
+    )
     msg_signature = require_query_param(request, "msg_signature")
     timestamp = require_query_param(request, "timestamp")
     nonce = require_query_param(request, "nonce")
@@ -5058,10 +5102,16 @@ async def wecom_kf_verify(request: Request):
 
 @app.post("/wecom/kf/callback")
 async def wecom_kf_callback(request: Request, background_tasks: BackgroundTasks):
+    encrypted_body = await request.body()
+    logger.info(
+        "wecom_kf_callback_hit client=%s query_keys=%s body_bytes=%s",
+        request_client_host(request),
+        request_query_keys(request),
+        len(encrypted_body),
+    )
     msg_signature = require_query_param(request, "msg_signature")
     timestamp = require_query_param(request, "timestamp")
     nonce = require_query_param(request, "nonce")
-    encrypted_body = await request.body()
 
     plain_xml = decrypt_wecom_kf_message(
         encrypted_body,
