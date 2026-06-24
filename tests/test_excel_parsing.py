@@ -95,6 +95,10 @@ class ExcelParsingTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in payloads[0]["items"]], ["香菇馄饨", "牛肉馄饨"])
         self.assertEqual([item["qty"] for item in payloads[0]["items"]], [3, 5])
 
+    def test_reject_non_excel_download_content(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not Excel"):
+            self.main.parse_excel_order_payloads(b'{"errcode":40007}', "media.xlsx")
+
     def test_skip_header_like_sheet_without_item_rows(self) -> None:
         workbook = Workbook()
         summary_sheet = workbook.active

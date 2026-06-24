@@ -18,6 +18,7 @@ from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from urllib.parse import unquote
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
@@ -2464,6 +2465,32 @@ def excel_header_units(row: tuple[Any, ...], header_map: dict[int, str]) -> dict
     return units
 
 
+def excel_file_signature(file_bytes: bytes) -> str:
+    sample = file_bytes[:64].lstrip()
+    if not sample:
+        return "empty"
+    if sample.startswith(b"PK\x03\x04"):
+        return "xlsx_zip"
+    if sample.startswith(b"\xd0\xcf\x11\xe0"):
+        return "legacy_xls"
+    if sample.startswith(b"{") or sample.startswith(b"["):
+        return "json"
+    if sample[:16].lower().startswith((b"<!doctype html", b"<html", b"<?xml")):
+        return "text_markup"
+    return "unknown"
+
+
+def ensure_excel_file_content(file_bytes: bytes) -> None:
+    signature = excel_file_signature(file_bytes)
+    if signature == "xlsx_zip":
+        return
+    if signature == "legacy_xls":
+        raise ValueError("Excel content is legacy .xls; please send .xlsx")
+    if signature in {"empty", "json", "text_markup"}:
+        raise ValueError(f"Downloaded content is not Excel: {signature}")
+    raise ValueError("Downloaded content is not a valid .xlsx file")
+
+
 def excel_row_has_value(row: tuple[Any, ...]) -> bool:
     return any(clean_order_value(value) for value in row)
 
@@ -2790,6 +2817,7 @@ def find_excel_order_rows(workbook: Any) -> tuple[list[tuple[Any, ...]], int, di
 
 
 def parse_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str, Any]]:
+    ensure_excel_file_content(file_bytes)
     workbook = load_workbook(BytesIO(file_bytes), data_only=True)
     tables = find_excel_order_tables(workbook)
     if not tables:
@@ -4687,10 +4715,13 @@ def get_wecom_kf_media(media_id: str) -> tuple[bytes, str, str]:
             raise RuntimeError("WeCom media/get returned invalid JSON") from exc
         raise RuntimeError(f"WeCom media/get failed: {data}")
 
-    filename = media_id
+    filename = ""
     disposition = response.headers.get("content-disposition", "")
+    encoded_match = re.search(r"filename\*=(?:UTF-8''|utf-8'')?([^;]+)", disposition)
+    if encoded_match:
+        filename = unquote(encoded_match.group(1).strip().strip('"'))
     match = re.search(r'filename="?([^";]+)"?', disposition)
-    if match:
+    if match and not filename:
         filename = match.group(1)
     return response.content, content_type, filename
 
@@ -4710,14 +4741,33 @@ def format_saved_order_ids(saved_orders: list[dict[str, Any]]) -> str:
     return "、".join(ids)
 
 
+def excel_order_failure_reply(exc: Exception) -> str:
+    error_text = str(exc)
+    if any(marker in error_text for marker in ("not Excel", "not a valid .xlsx", "File is not a zip file")):
+        return "Excel订单解析失败了。我这边收到的文件内容不像有效的 .xlsx，请重新发送原始 Excel 文件。"
+    if "legacy .xls" in error_text:
+        return "Excel订单解析失败了。当前只支持 .xlsx/.xlsm，请先把表格另存为 .xlsx 后再发。"
+    if any(marker in error_text for marker in ("no order item rows", "header row not found")):
+        return "Excel订单解析失败了。我没识别到连续的商品名称和数量数据区，请确认表头后面有实际订货数据。"
+    return "Excel订单解析失败了。请确认文件是标准订单表，且表头后面包含商品和数量数据。"
+
+
 def handle_excel_order_input(user_id: str, file_bytes: bytes, raw_ref: str) -> ChatResponse:
     try:
         saved = save_excel_order_payloads(file_bytes, raw_ref)
     except Exception as exc:
-        logger.warning("excel_order_import_failed user_id=%s raw_ref=%s error=%s", user_id, raw_ref, exc)
+        logger.warning(
+            "excel_order_import_failed user_id=%s raw_ref=%s size=%s signature=%s error=%s",
+            user_id,
+            raw_ref,
+            len(file_bytes),
+            excel_file_signature(file_bytes),
+            exc,
+            exc_info=True,
+        )
         return ChatResponse(
             user_id=user_id,
-            answer="Excel订单解析失败了。请确认文件是标准订单表，并包含商品名称和数量列。",
+            answer=excel_order_failure_reply(exc),
             history_length=user_order_count(user_id),
         )
 
@@ -4851,6 +4901,14 @@ def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
             media_bytes, content_type, downloaded_name = get_wecom_kf_media(media_id)
             filename = downloaded_name or filename
             extension = Path(filename).suffix.lower()
+            logger.info(
+                "wecom_kf_file_received msg_id=%s filename=%s content_type=%s size=%s signature=%s",
+                msg_id,
+                filename,
+                content_type,
+                len(media_bytes),
+                excel_file_signature(media_bytes),
+            )
             if extension not in {".xlsx", ".xlsm"} and "spreadsheet" not in content_type:
                 answer = "这个文件我暂时只支持标准 Excel 订单表。"
             else:
