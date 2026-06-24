@@ -142,6 +142,102 @@ class RoutingStateTests(unittest.TestCase):
         self.assertEqual(draft["items"][0]["qty"], 20)
         self.assertEqual(draft["items"][0]["unit"], "件")
 
+    def test_order_cancel_single_item_keeps_remaining_draft(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [
+                    {"name": "鸡腿", "qty": 20, "unit": "件"},
+                    {"name": "鸭腿", "qty": 5, "unit": "件"},
+                ],
+                "change_type": "add",
+            },
+        )
+        response = self.main.handle_user_message("u1", "取消鸡腿")
+        draft = self.main.get_order_draft("u1")
+        self.assertIn("已按你的修改更新订单草稿", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_ORDER)
+        self.assertEqual([item["name"] for item in draft["items"]], ["鸭腿"])
+
+    def test_order_modify_named_item_quantity_without_llm(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [
+                    {"name": "鸡腿", "qty": 20, "unit": "件"},
+                    {"name": "鸭腿", "qty": 5, "unit": "件"},
+                ],
+                "change_type": "add",
+            },
+        )
+        with patch.object(self.main, "llm_parse_order_draft", side_effect=AssertionError("LLM should not be called")):
+            response = self.main.handle_user_message("u1", "鸡腿数量改成30件")
+        draft = self.main.get_order_draft("u1")
+        self.assertIn("已按你的修改更新订单草稿", response.answer)
+        self.assertEqual(draft["items"][0]["qty"], 30)
+        self.assertEqual(draft["items"][0]["unit"], "件")
+        self.assertEqual(draft["items"][1]["qty"], 5)
+
+    def test_order_add_item_to_existing_draft_without_llm(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+                "change_type": "add",
+            },
+        )
+        with patch.object(self.main, "llm_parse_order_draft", side_effect=AssertionError("LLM should not be called")):
+            response = self.main.handle_user_message("u1", "再加鸭腿5件")
+        draft = self.main.get_order_draft("u1")
+        self.assertIn("已按你的修改更新订单草稿", response.answer)
+        self.assertEqual([item["name"] for item in draft["items"]], ["鸡腿", "鸭腿"])
+        self.assertEqual(draft["items"][1]["qty"], 5)
+        self.assertEqual(draft["items"][1]["unit"], "件")
+
+    def test_receipt_modify_named_item_quantity_with_multiple_items(self) -> None:
+        self.main.save_receipt_draft(
+            "u1",
+            {
+                "date": "2026-06-24",
+                "items": [
+                    {"name": "鲜肉馄饨", "qty": 10, "unit": "箱"},
+                    {"name": "虾肉馄饨", "qty": 6, "unit": "箱"},
+                ],
+            },
+        )
+        response = self.main.handle_user_message("u1", "鲜肉馄饨数量改成20件")
+        draft = self.main.get_receipt_draft("u1")
+        self.assertIn("已按你的修改更新入库草稿", response.answer)
+        self.assertEqual(draft["items"][0]["qty"], 20)
+        self.assertEqual(draft["items"][0]["unit"], "件")
+        self.assertEqual(draft["items"][1]["qty"], 6)
+
+    def test_receipt_cancel_single_item_keeps_remaining_draft(self) -> None:
+        self.main.save_receipt_draft(
+            "u1",
+            {
+                "date": "2026-06-24",
+                "items": [
+                    {"name": "鲜肉馄饨", "qty": 10, "unit": "箱"},
+                    {"name": "虾肉馄饨", "qty": 6, "unit": "箱"},
+                ],
+            },
+        )
+        response = self.main.handle_user_message("u1", "取消鲜肉馄饨")
+        draft = self.main.get_receipt_draft("u1")
+        self.assertIn("已按你的修改更新入库草稿", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_RECEIPT)
+        self.assertEqual([item["name"] for item in draft["items"]], ["虾肉馄饨"])
+
     def test_confirm_question_is_not_confirm_command(self) -> None:
         self.assertFalse(self.main.is_confirm_command("发票可以开吗", has_draft=True))
         self.assertFalse(self.main.is_confirm_command("这个可以吗", has_draft=True))

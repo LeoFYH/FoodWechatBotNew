@@ -1631,6 +1631,9 @@ ORDER_LIKE_KEYWORDS = {
     "盒",
     "包",
 }
+ITEM_UNIT_PATTERN = r"(箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)"
+ITEM_REMOVE_KEYWORDS = {"取消", "删除", "删掉", "去掉", "不要"}
+ORDER_ADD_PREFIX_PATTERN = r"(?:再加|追加|新增|补|加|再来)"
 
 
 def looks_like_order_message(message: str) -> bool:
@@ -2285,17 +2288,127 @@ def replace_text_field(container: dict[str, Any], key: str, old_value: str, new_
     return True
 
 
-def apply_simple_order_draft_modification(draft: dict[str, Any], message: str) -> dict[str, Any] | None:
+def item_matches_command(item: dict[str, Any], command: str) -> bool:
+    for key in ("name", "code"):
+        value = normalize_command(str(item.get(key) or ""))
+        if value and value in command:
+            return True
+    return False
+
+
+def matching_item_indexes(items: list[Any], command: str) -> set[int]:
+    return {
+        index
+        for index, item in enumerate(items)
+        if isinstance(item, dict) and item_matches_command(item, command)
+    }
+
+
+def remove_items_from_message(updated: dict[str, Any], message: str) -> bool:
+    command = normalize_command(message)
+    if not command_contains_any(command, ITEM_REMOVE_KEYWORDS):
+        return False
+
+    items = updated.get("items")
+    if not isinstance(items, list):
+        return False
+
+    indexes = matching_item_indexes(items, command)
+    if not indexes:
+        return False
+
+    updated["items"] = [item for index, item in enumerate(items) if index not in indexes]
+    return True
+
+
+def extract_quantity_update(message: str) -> tuple[int | float, str | None] | None:
+    patterns = [
+        rf"(?:数量|qty)?(?:改成|改为|换成|调整为|变成|是|=|:|：)\s*(\d+(?:\.\d+)?)\s*{ITEM_UNIT_PATTERN}?",
+        rf"(\d+(?:\.\d+)?)\s*{ITEM_UNIT_PATTERN}?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if not match:
+            continue
+        qty = normalize_number(match.group(1))
+        if qty is None:
+            continue
+        unit = match.group(2) if len(match.groups()) > 1 else None
+        return qty, unit
+    return None
+
+
+def update_named_item_quantity(updated: dict[str, Any], message: str) -> bool:
+    items = updated.get("items")
+    if not isinstance(items, list):
+        return False
+
+    command = normalize_command(message)
+    indexes = matching_item_indexes(items, command)
+    if not indexes:
+        return False
+
+    quantity_update = extract_quantity_update(message)
+    if not quantity_update:
+        return False
+
+    qty, unit = quantity_update
+    changed = False
+    for index in indexes:
+        item = items[index]
+        if not isinstance(item, dict):
+            continue
+        item["qty"] = qty
+        if unit:
+            item["unit"] = unit
+        changed = True
+    return changed
+
+
+def parse_order_added_items(message: str) -> list[dict[str, Any]]:
+    added_items: list[dict[str, Any]] = []
+    pattern = rf"{ORDER_ADD_PREFIX_PATTERN}\s*([^0-9，,。；;\n]+?)\s*(\d+(?:\.\d+)?)\s*{ITEM_UNIT_PATTERN}?"
+    for match in re.finditer(pattern, message):
+        name = clean_order_value(match.group(1)).strip(" ，,。.;；")
+        qty = normalize_number(match.group(2))
+        if not name or qty is None:
+            continue
+        added_items.append(
+            normalize_patch_item(
+                {
+                    "name": name,
+                    "qty": qty,
+                    "unit": match.group(3) or "",
+                }
+            )
+        )
+    return added_items
+
+
+def add_items_from_message(updated: dict[str, Any], message: str) -> bool:
+    new_items = parse_order_added_items(message)
+    if not new_items:
+        return False
+
+    items = updated.get("items")
+    if not isinstance(items, list):
+        items = []
+    items.extend(new_items)
+    updated["items"] = items
+    if updated.get("kind") == ORDER_KIND_PATCH:
+        updated["change_type"] = ORDER_CHANGE_ADD
+    return True
+
+
+def replace_order_text_fields(updated: dict[str, Any], message: str) -> bool:
     replacement = parse_simple_order_replacement(message)
     if not replacement:
-        return None
+        return False
 
     old_value, new_value = replacement
-    updated = json.loads(json.dumps(draft, ensure_ascii=False))
     changed = False
     for key in ("store", "order_no", "orderer", "deliver_date", "order_date", "raw_text"):
         changed = replace_text_field(updated, key, old_value, new_value) or changed
-
     items = updated.get("items")
     if isinstance(items, list):
         for item in items:
@@ -2303,6 +2416,17 @@ def apply_simple_order_draft_modification(draft: dict[str, Any], message: str) -
                 continue
             for key in ("code", "name", "spec", "unit", "category"):
                 changed = replace_text_field(item, key, old_value, new_value) or changed
+
+    return changed
+
+
+def apply_simple_order_draft_modification(draft: dict[str, Any], message: str) -> dict[str, Any] | None:
+    updated = json.loads(json.dumps(draft, ensure_ascii=False))
+    changed = False
+    changed = remove_items_from_message(updated, message) or changed
+    changed = update_named_item_quantity(updated, message) or changed
+    changed = add_items_from_message(updated, message) or changed
+    changed = replace_order_text_fields(updated, message) or changed
 
     if not changed:
         return None
@@ -3824,6 +3948,9 @@ def apply_simple_receipt_draft_modification(draft: dict[str, Any], message: str)
     updated = json.loads(json.dumps(draft, ensure_ascii=False))
     changed = False
     command = normalize_command(message)
+
+    changed = remove_items_from_message(updated, message) or changed
+    changed = update_named_item_quantity(updated, message) or changed
 
     replacement = parse_simple_order_replacement(message)
     if replacement:

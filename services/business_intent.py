@@ -56,6 +56,8 @@ EXACT_EXIT = {"退出", "结束", "返回", "退出订单", "退出入库", "结
 
 CANCEL_KEYWORDS = {"取消", "清空", "不要了", "作废", "删掉草稿"}
 EXIT_KEYWORDS = {"退出", "返回普通", "结束订单", "结束入库"}
+ITEM_CANCEL_KEYWORDS = {"取消", "删除", "删掉", "去掉", "不要"}
+WHOLE_DRAFT_KEYWORDS = {"草稿", "订单", "整单", "全部", "所有", "这单", "这个订单", "入库记录"}
 REJECT_KEYWORDS = {
     "不对",
     "不是",
@@ -72,6 +74,11 @@ REJECT_KEYWORDS = {
     "等会",
 }
 MODIFY_KEYWORDS = {
+    "加",
+    "再加",
+    "追加",
+    "新增",
+    "补",
     "改",
     "修改",
     "改成",
@@ -140,6 +147,12 @@ def looks_like_correction(text: str) -> bool:
     return False
 
 
+def looks_like_item_level_cancel(text: str) -> bool:
+    if text in EXACT_CANCEL:
+        return False
+    return contains_any(text, ITEM_CANCEL_KEYWORDS) and not contains_any(text, WHOLE_DRAFT_KEYWORDS)
+
+
 def looks_like_question(text: str) -> bool:
     return contains_any(text, QUESTION_LIKE_KEYWORDS)
 
@@ -149,7 +162,7 @@ def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
     if not text:
         return BusinessIntent(INTENT_UNCLEAR, 0.0, "rule", "empty")
 
-    if text in EXACT_CANCEL or contains_any(text, CANCEL_KEYWORDS):
+    if text in EXACT_CANCEL:
         return BusinessIntent(INTENT_CANCEL, 0.98, "rule", "cancel keyword")
     if text in EXACT_EXIT or contains_any(text, EXIT_KEYWORDS):
         return BusinessIntent(INTENT_EXIT, 0.98, "rule", "exit keyword")
@@ -157,6 +170,10 @@ def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
     if not has_draft:
         return BusinessIntent(INTENT_CHAT, 0.7, "rule", "no draft")
 
+    if looks_like_item_level_cancel(text):
+        return BusinessIntent(INTENT_MODIFY, 0.92, "rule", "item cancel keyword")
+    if contains_any(text, CANCEL_KEYWORDS):
+        return BusinessIntent(INTENT_CANCEL, 0.98, "rule", "cancel keyword")
     if looks_like_correction(text):
         return BusinessIntent(INTENT_MODIFY, 0.92, "rule", "correction keyword")
     if contains_any(text, REJECT_KEYWORDS):
