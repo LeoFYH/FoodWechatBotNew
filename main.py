@@ -1198,6 +1198,12 @@ ORDER_DRAFT_VIEW_KEYWORDS = {
     "这单有啥",
     "这单有什么",
     "这张订单",
+    "重复一遍订单",
+    "重复订单",
+    "复述订单",
+    "再说一遍订单",
+    "再发一遍订单",
+    "订单再发一遍",
 }
 ORDER_QUERY_KEYWORDS = {"查", "查询", "看", "结果", "同步", "拉取", "有没有", "了吗", "是否", "状态"}
 BUSINESS_NEGATION_KEYWORDS = {"不要", "不用", "别", "先别", "不需要", "取消", "撤回", "退"}
@@ -1344,7 +1350,7 @@ EXCEL_HEADER_ALIASES = {
     "order_date": {"下单日期", "订单日期", "订货日期", "日期", "制单日期"},
     "deliver_date": {"送达日期", "送货日期", "配送日期", "交付日期", "到货日期"},
     "code": {"商品编码", "编码", "货号", "商品代码", "code", "物料编码"},
-    "name": {"商品名称", "商品名称规格", "品名规格", "品名", "名称", "商品", "产品名称", "货品名称", "货物名称", "name", "物料名称"},
+    "name": {"商品名称", "商品名称规格", "品名规格", "品名", "名称", "商品", "产品名称", "货品名称", "货物名称", "name", "物料名称", "原料名称"},
     "spec": {"规格", "规格型号", "型号", "包装规格", "spec"},
     "unit": {"单位", "unit"},
     "qty": {"数量", "订货数量", "订购数量", "下单数量", "箱数", "件数", "qty"},
@@ -1663,6 +1669,25 @@ ORDER_LIKE_KEYWORDS = {
 ITEM_UNIT_PATTERN = r"(箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)"
 ITEM_REMOVE_KEYWORDS = {"取消", "删除", "删掉", "去掉", "不要"}
 ORDER_ADD_PREFIX_PATTERN = r"(?:再加|追加|新增|补|加|再来)"
+ORDER_COMPLEX_ACTION_KEYWORDS = {
+    "取消",
+    "删除",
+    "删掉",
+    "去掉",
+    "不要",
+    "换成",
+    "换为",
+    "改成",
+    "改为",
+    "修改",
+    "调整",
+    "再加",
+    "追加",
+    "新增",
+    "补",
+    "加",
+}
+ORDER_COMPLEX_CONNECTORS = {"然后", "再然后", "另外", "顺便", "同时", "并且", "以及"}
 
 
 def looks_like_order_message(message: str) -> bool:
@@ -1679,6 +1704,35 @@ def looks_like_order_message(message: str) -> bool:
     if command_contains_any(command, ORDER_LIKE_KEYWORDS) and re.search(r"\d", text):
         return True
     return False
+
+
+def count_keyword_occurrences(text: str, keywords: set[str]) -> int:
+    return sum(text.count(keyword) for keyword in keywords if keyword)
+
+
+def is_overly_complex_order_instruction(message: str) -> bool:
+    command = normalize_command(message)
+    if len(command) < 22:
+        return False
+    action_count = count_keyword_occurrences(command, ORDER_COMPLEX_ACTION_KEYWORDS)
+    if action_count < 2:
+        return False
+    connector_count = count_keyword_occurrences(command, ORDER_COMPLEX_CONNECTORS)
+    quantity_count = len(re.findall(r"\d+(?:\.\d+)?\s*(?:箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)", message))
+    if action_count >= 4:
+        return True
+    if connector_count >= 2:
+        return True
+    return quantity_count >= 2 and action_count >= 3
+
+
+def complex_order_instruction_reply(*, has_draft: bool) -> str:
+    target = "更新订单草稿" if has_draft else "进入订单草稿"
+    return (
+        f"这句话包含的动作太多，我先不{target}，避免记错。"
+        "请拆开说清楚，比如先发“把鸡蛋面换成小麦面”，我复述草稿后，"
+        "再发“加猪肉烧卖、牛肉烧卖各10斤”。"
+    )
 
 
 def looks_like_receipt_business_message(message: str) -> bool:
@@ -2293,7 +2347,7 @@ def classify_order_reply_intent(message: str, draft: dict[str, Any]) -> Business
 
 def business_confirm_clarification(*, receipt: bool = False) -> str:
     subject = "这条入库记录" if receipt else "这张订单"
-    return f"我不确定你是不是要保存{subject}。确认无误请回“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
+    return f"这句话我先不当成确认或修改，{subject}草稿保持不变。确认无误请回“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
 
 
 def order_draft_reply(prefix: str, draft: dict[str, Any], missing: list[str]) -> str:
@@ -2351,6 +2405,8 @@ def remove_items_from_message(updated: dict[str, Any], message: str) -> bool:
     command = normalize_command(message)
     if not command_contains_any(command, ITEM_REMOVE_KEYWORDS):
         return False
+    if parse_cancel_replace_order_items(message):
+        return False
 
     items = updated.get("items")
     if not isinstance(items, list):
@@ -2381,6 +2437,85 @@ def extract_quantity_update(message: str) -> tuple[int | float, str | None] | No
     return None
 
 
+def parse_cancel_replace_order_items(message: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    stop_pattern = r"(?=\s*(?:然后|再|并|另外|顺便|$|[，,。；;\n]))"
+    patterns = [
+        rf"(?:把)?\s*([^，,。；;\n]+?)\s*(?:取消|不要了?|删除|删掉|去掉)\s*(?:换成|换为|改成|改为|替换成|变成)\s*([^，,。；;\n]+?){stop_pattern}",
+        rf"(?:取消|不要了?|删除|删掉|去掉)\s*([^，,。；;\n]+?)\s*(?:换成|换为|改成|改为|替换成|变成)\s*([^，,。；;\n]+?){stop_pattern}",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, message):
+            old_value = clean_order_value(match.group(1)).strip(" ，,。.;；")
+            new_value = clean_order_value(match.group(2)).strip(" ，,。.;；")
+            if not old_value or not new_value or old_value == new_value:
+                continue
+            pairs.append((old_value, new_value))
+    return pairs
+
+
+def replace_cancelled_order_items(updated: dict[str, Any], message: str) -> bool:
+    pairs = parse_cancel_replace_order_items(message)
+    if not pairs:
+        return False
+
+    items = updated.get("items")
+    if not isinstance(items, list):
+        return False
+
+    changed = False
+    for old_value, new_value in pairs:
+        old_command = normalize_command(old_value)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("name", "spec", "category"):
+                value = item.get(key)
+                if not isinstance(value, str):
+                    continue
+                if old_value in value:
+                    item[key] = value.replace(old_value, new_value)
+                    changed = True
+                elif old_command and old_command in normalize_command(value):
+                    item[key] = new_value
+                    changed = True
+    return changed
+
+
+def split_shared_quantity_item_names(value: str) -> list[str]:
+    text = clean_order_value(value).strip(" ，,。.;；、和及")
+    text = re.sub(r"^(?:一个|一份|1个)", "", text).strip(" ，,。.;；")
+    if not text:
+        return []
+
+    parts = [
+        clean_order_value(part).strip(" ，,。.;；")
+        for part in re.split(r"(?:\s+|、|，|,|/|和|及|以及)", text)
+    ]
+    return [part for part in parts if part]
+
+
+def parse_shared_quantity_added_items(message: str) -> list[dict[str, Any]]:
+    added_items: list[dict[str, Any]] = []
+    pattern = rf"{ORDER_ADD_PREFIX_PATTERN}\s*([^0-9，,。；;\n]+?)\s*各\s*(\d+(?:\.\d+)?)\s*{ITEM_UNIT_PATTERN}?"
+    for match in re.finditer(pattern, message):
+        names = split_shared_quantity_item_names(match.group(1))
+        qty = normalize_number(match.group(2))
+        if len(names) < 2 or qty is None:
+            continue
+        for name in names:
+            added_items.append(
+                normalize_patch_item(
+                    {
+                        "name": name,
+                        "qty": qty,
+                        "unit": match.group(3) or "",
+                    }
+                )
+            )
+    return added_items
+
+
 def update_named_item_quantity(updated: dict[str, Any], message: str) -> bool:
     items = updated.get("items")
     if not isinstance(items, list):
@@ -2409,6 +2544,10 @@ def update_named_item_quantity(updated: dict[str, Any], message: str) -> bool:
 
 
 def parse_order_added_items(message: str) -> list[dict[str, Any]]:
+    shared_quantity_items = parse_shared_quantity_added_items(message)
+    if shared_quantity_items:
+        return shared_quantity_items
+
     added_items: list[dict[str, Any]] = []
     pattern = rf"{ORDER_ADD_PREFIX_PATTERN}\s*([^0-9，,。；;\n]+?)\s*(\d+(?:\.\d+)?)\s*{ITEM_UNIT_PATTERN}?"
     for match in re.finditer(pattern, message):
@@ -2490,6 +2629,7 @@ def replace_order_text_fields(updated: dict[str, Any], message: str) -> bool:
 def apply_simple_order_draft_modification(draft: dict[str, Any], message: str) -> dict[str, Any] | None:
     updated = json.loads(json.dumps(draft, ensure_ascii=False))
     changed = False
+    changed = replace_cancelled_order_items(updated, message) or changed
     changed = remove_items_from_message(updated, message) or changed
     changed = update_named_item_quantity(updated, message) or changed
     changed = add_items_from_message(updated, message) or changed
@@ -2894,7 +3034,40 @@ def score_excel_header_candidate(rows: list[tuple[Any, ...]], header_index: int)
     return best_score, best_map, best_item_count
 
 
+def count_labeled_excel_items(rows: list[tuple[Any, ...]], header_index: int, header_map: dict[int, str]) -> int:
+    name_indexes = [index for index, key in header_map.items() if key == "name"]
+    qty_indexes = [index for index, key in header_map.items() if key == "qty"]
+    if not name_indexes or not qty_indexes:
+        return 0
+
+    item_count = 0
+    for row in rows[header_index + 1 : header_index + 160]:
+        if not excel_row_has_value(row):
+            continue
+        for name_index in name_indexes:
+            name_value = excel_cell_value(row, name_index)
+            if not looks_like_excel_item_name(name_value):
+                continue
+            if any(excel_quantity_number(excel_cell_value(row, qty_index)) is not None for qty_index in qty_indexes):
+                item_count += 1
+                break
+    return item_count
+
+
 def find_excel_header_row(rows: list[tuple[Any, ...]]) -> tuple[int, dict[int, str]]:
+    has_labeled_header = False
+    for index, row in enumerate(rows):
+        if not excel_row_has_value(row):
+            continue
+        header_map = excel_label_header_map(row)
+        if "name" not in header_map.values() or "qty" not in header_map.values():
+            continue
+        has_labeled_header = True
+        if count_labeled_excel_items(rows, index, header_map) > 0:
+            return index, header_map
+    if has_labeled_header:
+        raise ValueError("Excel file contains no order item rows after labeled header")
+
     best_index = -1
     best_map: dict[int, str] = {}
     best_score = 0
@@ -3967,6 +4140,13 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 history_length=history_length,
             )
 
+        if is_overly_complex_order_instruction(message):
+            return ChatResponse(
+                user_id=user_id,
+                answer=complex_order_instruction_reply(has_draft=True),
+                history_length=history_length,
+            )
+
         intent = classify_order_reply_intent(message, existing_draft)
         if intent.intent == INTENT_CANCEL and intent.is_rule:
             clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
@@ -4011,6 +4191,13 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
         return ChatResponse(
             user_id=user_id,
             answer="现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。",
+            history_length=history_length,
+        )
+
+    if is_overly_complex_order_instruction(message):
+        return ChatResponse(
+            user_id=user_id,
+            answer=complex_order_instruction_reply(has_draft=False),
             history_length=history_length,
         )
 
@@ -4431,6 +4618,14 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         return ChatResponse(
             user_id=user_id,
             answer=build_order_storage_query_reply(user_id),
+            history_length=user_order_count(user_id),
+        )
+
+    complex_order_message = inline_order_message if inline_order_message is not None else message
+    if not has_any_draft and is_overly_complex_order_instruction(complex_order_message):
+        return ChatResponse(
+            user_id=user_id,
+            answer=complex_order_instruction_reply(has_draft=False),
             history_length=user_order_count(user_id),
         )
 

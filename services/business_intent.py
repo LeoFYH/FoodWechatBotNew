@@ -73,6 +73,7 @@ REJECT_KEYWORDS = {
     "稍等",
     "等会",
 }
+DRAFT_AMBIGUOUS_NO_ACTION = {"没事", "没事了", "没事儿", "没事啦"}
 MODIFY_KEYWORDS = {
     "加",
     "再加",
@@ -136,6 +137,28 @@ CONFIRM_STARTS = (
     "走吧",
     "就这样",
 )
+CONFIRM_ACTION_KEYWORDS = {
+    "确认",
+    "保存",
+    "提交",
+    "可以",
+    "对",
+    "是",
+    "没错",
+    "没问题",
+    "ok",
+    "okay",
+    "yes",
+    "记下",
+    "录入",
+    "写库",
+    "入库吧",
+    "直接入库",
+    "就这样",
+    "妥",
+    "安排",
+    "走吧",
+}
 QUESTION_LIKE_KEYWORDS = {"吗", "么", "?", "？", "能不能", "可不可以", "是否", "怎么", "如何", "什么", "多少", "价格", "发票"}
 
 
@@ -157,6 +180,16 @@ def looks_like_question(text: str) -> bool:
     return contains_any(text, QUESTION_LIKE_KEYWORDS)
 
 
+def looks_like_confirm_action(text: str) -> bool:
+    if looks_like_question(text):
+        return False
+    if text in CONFIRM_EXACT or text.startswith(CONFIRM_STARTS):
+        return True
+    if contains_any(text, REJECT_KEYWORDS | CANCEL_KEYWORDS | MODIFY_KEYWORDS):
+        return False
+    return contains_any(text, CONFIRM_ACTION_KEYWORDS)
+
+
 def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
     text = normalize_reply(message)
     if not text:
@@ -170,6 +203,8 @@ def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
     if not has_draft:
         return BusinessIntent(INTENT_CHAT, 0.7, "rule", "no draft")
 
+    if text in DRAFT_AMBIGUOUS_NO_ACTION:
+        return BusinessIntent(INTENT_CHAT, 0.7, "rule", "ambiguous no-action reply")
     if looks_like_item_level_cancel(text):
         return BusinessIntent(INTENT_MODIFY, 0.92, "rule", "item cancel keyword")
     if contains_any(text, CANCEL_KEYWORDS):
@@ -178,7 +213,7 @@ def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
         return BusinessIntent(INTENT_MODIFY, 0.92, "rule", "correction keyword")
     if contains_any(text, REJECT_KEYWORDS):
         return BusinessIntent(INTENT_REJECT, 0.92, "rule", "reject keyword")
-    if not looks_like_question(text) and (text in CONFIRM_EXACT or text.startswith(CONFIRM_STARTS)):
+    if looks_like_confirm_action(text):
         return BusinessIntent(INTENT_CONFIRM, 0.95, "rule", "confirm phrase")
 
     return BusinessIntent(INTENT_UNCLEAR, 0.0, "rule", "needs llm")
@@ -266,7 +301,8 @@ def classify_business_intent(
         return BusinessIntent(INTENT_UNCLEAR, 0.0, "llm_error", "classifier failed")
 
     llm_intent = parse_llm_intent(raw_result)
-    if llm_intent.intent == INTENT_CONFIRM and llm_intent.confidence >= LLM_CONFIRM_THRESHOLD:
+    text = normalize_reply(message)
+    if llm_intent.intent == INTENT_CONFIRM and llm_intent.confidence >= LLM_CONFIRM_THRESHOLD and looks_like_confirm_action(text):
         return llm_intent
     if llm_intent.intent == INTENT_MODIFY and llm_intent.confidence >= LLM_MODIFY_THRESHOLD:
         return llm_intent

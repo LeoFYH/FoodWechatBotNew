@@ -226,6 +226,126 @@ class RoutingStateTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in draft["items"]], ["鸡腿", "牛肉烧麦"])
         self.assertIsNone(draft["items"][1]["qty"])
 
+    def test_ambiguous_done_reply_does_not_confirm_order_draft(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+                "change_type": "add",
+            },
+        )
+
+        with patch.object(
+            self.main,
+            "call_business_intent_llm",
+            return_value='{"intent":"confirm","confidence":0.96,"reason":"用户说没事了"}',
+        ):
+            response = self.main.handle_user_message("u1", "没事了")
+
+        self.assertNotIn("已保存订单入库", response.answer)
+        self.assertIn("确认", response.answer)
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
+        self.assertEqual(self.main.user_order_count("u1"), 0)
+
+    def test_order_add_shared_quantity_items_splits_each_item(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+                "change_type": "add",
+            },
+        )
+
+        with patch.object(self.main, "llm_parse_order_draft", side_effect=AssertionError("LLM should not be called")):
+            response = self.main.handle_user_message("u1", "再加猪肉烧卖 牛肉烧卖各10斤")
+
+        draft = self.main.get_order_draft("u1")
+        self.assertIn("已按你的修改更新订单草稿", response.answer)
+        self.assertEqual([item["name"] for item in draft["items"]], ["鸡腿", "猪肉烧卖", "牛肉烧卖"])
+        self.assertEqual(draft["items"][1]["qty"], 10)
+        self.assertEqual(draft["items"][1]["unit"], "斤")
+        self.assertEqual(draft["items"][2]["qty"], 10)
+        self.assertEqual(draft["items"][2]["unit"], "斤")
+
+    def test_order_replace_item_then_add_shared_quantity_items(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "base",
+                "source": "photo",
+                "store": "北京航食",
+                "order_no": "北京航食-2026-06-16",
+                "orderer": "王丽璞",
+                "order_date": "2026-06-16",
+                "deliver_date": "2026-06-17",
+                "items": [
+                    {
+                        "code": "101205032",
+                        "name": "冷冻熟制鸡蛋面",
+                        "spec": "160克*64块",
+                        "unit": "箱",
+                        "qty": 1,
+                        "price": 716.8,
+                        "category": "冷冻熟食品库",
+                    }
+                ],
+            },
+        )
+
+        with patch.object(self.main, "llm_parse_order_draft", side_effect=AssertionError("LLM should not be called")):
+            response = self.main.handle_user_message("u1", "鸡蛋面取消 换成小麦面 然后加猪肉烧卖 牛肉烧卖各10斤")
+
+        draft = self.main.get_order_draft("u1")
+        self.assertIn("已按你的修改更新订单草稿", response.answer)
+        self.assertEqual([item["name"] for item in draft["items"]], ["冷冻熟制小麦面", "猪肉烧卖", "牛肉烧卖"])
+        self.assertEqual(draft["items"][0]["qty"], 1)
+        self.assertEqual(draft["items"][1]["qty"], 10)
+        self.assertEqual(draft["items"][1]["unit"], "斤")
+        self.assertEqual(draft["items"][2]["qty"], 10)
+        self.assertEqual(draft["items"][2]["unit"], "斤")
+
+    def test_overly_complex_order_update_keeps_existing_draft_unchanged(self) -> None:
+        original = {
+            "kind": "patch",
+            "source": "text",
+            "store": "老三家",
+            "items": [
+                {"name": "鸡蛋面", "qty": 1, "unit": "箱"},
+                {"name": "鸭腿", "qty": 8, "unit": "件"},
+                {"name": "馄饨", "qty": 3, "unit": "箱"},
+            ],
+            "change_type": "add",
+        }
+        self.main.save_order_draft("u1", original)
+
+        with patch.object(self.main, "llm_parse_order_draft", side_effect=AssertionError("LLM should not be called")):
+            response = self.main.handle_user_message(
+                "u1",
+                "鸡蛋面取消换成小麦面然后加猪肉烧卖牛肉烧卖各10斤再把鸭腿改成5件顺便不要馄饨",
+            )
+
+        draft = self.main.get_order_draft("u1")
+        self.assertIn("这句话包含的动作太多", response.answer)
+        self.assertEqual([item["name"] for item in draft["items"]], ["鸡蛋面", "鸭腿", "馄饨"])
+        self.assertEqual([item["qty"] for item in draft["items"]], [1, 8, 3])
+
+    def test_overly_complex_order_text_does_not_enter_draft(self) -> None:
+        with patch.object(self.main, "llm_parse_order_draft", side_effect=AssertionError("LLM should not be called")):
+            response = self.main.handle_user_message(
+                "u1",
+                "老三家鸡蛋面取消换成小麦面然后加猪肉烧卖牛肉烧卖各10斤再把鸭腿改成5件顺便不要馄饨",
+            )
+
+        self.assertIn("这句话包含的动作太多", response.answer)
+        self.assertFalse(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+
     def test_order_draft_view_command_shows_current_draft_without_llm(self) -> None:
         self.main.save_order_draft(
             "u1",
@@ -267,6 +387,25 @@ class RoutingStateTests(unittest.TestCase):
         self.assertIn("当前订单草稿", response.answer)
         self.assertIn("鸡腿", response.answer)
         self.assertNotIn("我不确定你是不是要保存", response.answer)
+
+    def test_order_draft_repeat_command_shows_current_draft_without_llm(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+                "change_type": "add",
+            },
+        )
+        with patch.object(self.main, "call_business_intent_llm", side_effect=AssertionError("LLM should not be called")):
+            response = self.main.handle_user_message("u1", "重复一遍订单")
+
+        self.assertIn("当前订单草稿", response.answer)
+        self.assertIn("鸡腿", response.answer)
+        self.assertNotIn("我不确定你是不是要保存", response.answer)
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
 
     def test_receipt_modify_named_item_quantity_with_multiple_items(self) -> None:
         self.main.save_receipt_draft(

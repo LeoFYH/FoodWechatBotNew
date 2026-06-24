@@ -193,6 +193,47 @@ class ExcelParsingTests(unittest.TestCase):
 
         self.assertEqual(columns, [0, 1, 299])
 
+    def test_raw_material_name_header_maps_to_product_name(self) -> None:
+        header_map = self.main.excel_label_header_map(("序号", "原料名称", "规格", "单位", "单价", "订货数量"))
+
+        self.assertEqual(header_map[1], "name")
+        self.assertEqual(header_map[5], "qty")
+
+    def test_labeled_header_returns_without_scoring_every_data_row(self) -> None:
+        rows = [
+            ("馄饨侯鼓楼店", "产品订货单"),
+            ("订货日期：", 46193),
+            ("序号", "原料名称", "规格", "单位", "单价", "订货数量", "备注"),
+            *[
+                (index, f"商品{index}", "1kg", "箱", 10, 1 if index % 10 == 0 else None, "分类")
+                for index in range(1, 80)
+            ],
+        ]
+
+        with patch.object(self.main, "score_excel_header_candidate", wraps=self.main.score_excel_header_candidate) as scorer:
+            header_index, header_map = self.main.find_excel_header_row(rows)
+
+        self.assertEqual(header_index, 2)
+        self.assertEqual(header_map[1], "name")
+        self.assertEqual(header_map[5], "qty")
+        self.assertLessEqual(scorer.call_count, 1)
+
+    def test_labeled_header_without_quantity_rows_does_not_fuzzy_scan_sheet(self) -> None:
+        rows = [
+            ("馄饨侯鼓楼店", "产品订货单"),
+            ("序号", "原料名称", "规格", "单位", "单价", "订货数量", "备注"),
+            *[
+                (index, f"鸡汤鲜肉馄饨{index}", "260g", "箱", 10, None, "馄饨")
+                for index in range(1, 80)
+            ],
+        ]
+
+        with patch.object(self.main, "score_excel_header_candidate", wraps=self.main.score_excel_header_candidate) as scorer:
+            with self.assertRaisesRegex(ValueError, "no order item rows"):
+                self.main.find_excel_header_row(rows)
+
+        self.assertEqual(scorer.call_count, 0)
+
     def test_excel_wechat_input_creates_confirmation_draft(self) -> None:
         workbook = Workbook()
         sheet = workbook.active
