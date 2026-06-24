@@ -36,6 +36,7 @@ from services.business_intent import (
     INTENT_CHAT,
     INTENT_CONFIRM,
     INTENT_EXIT,
+    INTENT_MODIFY,
     INTENT_REJECT,
     INTENT_UNCLEAR,
     BusinessIntent,
@@ -1139,12 +1140,59 @@ INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "
 EXIT_MODE_COMMANDS = {"退出", "结束", "不弄了", "算了", "返回", "退出订单", "退出入库", "结束订单", "结束入库"}
 STATUS_COMMANDS = {"状态", "我在哪", "我在哪儿", "当前状态", "现在状态", "现在是什么模式"}
 MODE_HELP_COMMANDS = {"模式", "有哪些模式", "有什么模式", "你有哪些模式", "你有什么模式", "怎么用", "你会什么", "功能", "帮助"}
-REVOKE_COMMANDS = {"撤回", "撤回上一单", "删了上一单", "删了", "刚那个不对", "刚才那个不对", "上一单不对"}
+REVOKE_COMMANDS = {
+    "撤回",
+    "撤销",
+    "撤回上一单",
+    "撤销上一单",
+    "撤回刚刚的入库",
+    "撤销刚刚的入库",
+    "撤回入库",
+    "撤销入库",
+    "删了上一单",
+    "删了",
+    "刚那个不对",
+    "刚才那个不对",
+    "上一单不对",
+}
 ORDER_EXPORT_COMMANDS = {"导出订单", "订单导出", "下载订单", "订单表", "导出订单表"}
 ORDER_CONFIRM_COMMANDS = {"确认", "确认订单", "保存", "保存订单", "提交", "提交订单"}
 CONFIRM_LIKE_KEYWORDS = {"确认", "确认无误", "没问题", "可以", "对的", "是的", "保存", "提交", "录入", "写库", "入数据库", "直接入库", "记下"}
 ORDER_STORAGE_QUERY_KEYWORDS = {"入库结果", "同步结果", "订单库", "数据库", "拉订单库", "同步订单", "查订单", "查一下订单", "看一下入库"}
 ORDER_CANCEL_COMMANDS = {"取消", "取消订单", "取消草稿", "清空", "清空订单", "清空草稿", "不要了"}
+ORDER_QUERY_KEYWORDS = {"查", "查询", "看", "结果", "同步", "拉取", "有没有", "了吗", "是否", "状态"}
+BUSINESS_NEGATION_KEYWORDS = {"不要", "不用", "别", "先别", "不需要", "取消", "撤回", "退"}
+QUESTION_LIKE_KEYWORDS = {"吗", "么", "?", "？", "能不能", "可不可以", "是否", "怎么", "如何", "什么", "多少", "几号", "价格", "发票"}
+SOFT_CONFIRM_COMMANDS = {
+    "ok",
+    "okay",
+    "yes",
+    "y",
+    "可以",
+    "可以的",
+    "行",
+    "行的",
+    "好",
+    "好的",
+    "对",
+    "对的",
+    "是",
+    "是的",
+    "没错",
+    "没问题",
+    "确认无误",
+    "记下",
+    "录入",
+    "写库",
+    "入数据库",
+    "直接入库",
+}
+GLOBAL_ROUTE_CHAT = "chat"
+GLOBAL_ROUTE_ORDER_TEXT = "order_text"
+GLOBAL_ROUTE_ENTER_ORDER = "enter_order"
+GLOBAL_ROUTE_ENTER_RECEIPT = "enter_receipt"
+GLOBAL_ROUTE_ORDER_QUERY = "order_query"
+GLOBAL_ROUTE_UNCLEAR = "unclear"
 
 ORDER_KIND_BASE = "base"
 ORDER_KIND_PATCH = "patch"
@@ -1251,25 +1299,25 @@ ORDER_CONTRACT_EXPORT_HEADERS = [
 ]
 
 EXCEL_HEADER_ALIASES = {
-    "store": {"门店", "门店/区域", "区域", "店铺", "店名", "客户", "客户名称", "收货方", "门店名称"},
+    "store": {"门店", "门店/区域", "区域", "店铺", "店名", "客户", "客户名称", "收货方", "门店名称", "收货门店", "收货店铺"},
     "order_no": {"订单号", "单号", "订单编号", "编号"},
     "orderer": {"下单人", "订货人", "订货员", "制单人", "联系人"},
-    "order_date": {"下单日期", "订单日期", "日期", "制单日期"},
+    "order_date": {"下单日期", "订单日期", "订货日期", "日期", "制单日期"},
     "deliver_date": {"送达日期", "送货日期", "配送日期", "交付日期", "到货日期"},
     "code": {"商品编码", "编码", "货号", "商品代码", "code", "物料编码"},
-    "name": {"商品名称", "品名", "名称", "商品", "name", "物料名称"},
+    "name": {"商品名称", "商品名称规格", "品名规格", "品名", "名称", "商品", "产品名称", "货品名称", "货物名称", "name", "物料名称"},
     "spec": {"规格", "规格型号", "型号", "包装规格", "spec"},
     "unit": {"单位", "unit"},
-    "qty": {"数量", "订货数量", "下单数量", "箱数", "件数", "qty"},
+    "qty": {"数量", "订货数量", "订购数量", "下单数量", "箱数", "件数", "qty"},
     "price": {"单价", "价格", "price"},
     "category": {"分类", "类别", "品类", "category"},
 }
 
 EXCEL_METADATA_LABELS = {
-    "store": {"门店", "门店/区域", "区域", "店铺", "客户", "收货方"},
+    "store": {"门店", "门店/区域", "区域", "店铺", "客户", "收货方", "门店名称", "收货门店", "收货店铺"},
     "order_no": {"订单号", "单号", "订单编号"},
     "orderer": {"下单人", "订货人", "联系人"},
-    "order_date": {"下单日期", "订单日期"},
+    "order_date": {"下单日期", "订单日期", "订货日期"},
     "deliver_date": {"送达日期", "送货日期", "配送日期", "到货日期"},
 }
 
@@ -1355,18 +1403,30 @@ def is_exit_mode_command(command: str) -> bool:
 def is_revoke_command(command: str) -> bool:
     return command in REVOKE_COMMANDS or command_contains_any(
         command,
-        {"撤回", "删了", "删除上一", "刚那个不对", "刚才那个不对", "上一单不对"},
+        {"撤回", "撤销", "删了", "删除上一", "刚那个不对", "刚才那个不对", "上一单不对"},
     )
+
+
+def is_receipt_revoke_target(command: str) -> bool:
+    return command_contains_any(command, {"入库", "入库记录", "成品", "产成品"})
 
 
 def is_status_command(command: str) -> bool:
     return command in STATUS_COMMANDS
 
 
+def is_business_query_or_negated(command: str) -> bool:
+    return command_contains_any(command, ORDER_QUERY_KEYWORDS | BUSINESS_NEGATION_KEYWORDS)
+
+
 def is_order_mode_command(command: str) -> bool:
     if command in ORDER_MODE_COMMANDS:
         return True
-    if "订单" in command and command_contains_any(command, {"我要", "要", "发", "传", "录", "下", "表", "图片", "照片", "模式"}):
+    if is_business_query_or_negated(command):
+        return False
+    if command_contains_any(command, {"我要下单", "帮我下单", "要下单", "我要录单", "帮我录单", "要录单", "我要录一单", "帮我录一单", "录一单"}):
+        return True
+    if "订单" in command and command_contains_any(command, {"发订单", "传订单", "录订单", "下订单", "订单表", "订单图片", "订单照片", "订单模式", "开始订单"}):
         return True
     return False
 
@@ -1374,7 +1434,9 @@ def is_order_mode_command(command: str) -> bool:
 def is_receipt_mode_command(command: str) -> bool:
     if command in RECEIPT_MODE_COMMANDS:
         return True
-    if "入库" in command and command_contains_any(command, {"我要", "要", "发", "传", "照片", "图片", "模式", "产成品", "成品"}):
+    if is_business_query_or_negated(command) or command_contains_any(command, QUESTION_LIKE_KEYWORDS):
+        return False
+    if "入库" in command and command_contains_any(command, {"开始", "发", "传", "照片", "图片", "模式", "产成品", "成品", "录", "记"}):
         return True
     return False
 
@@ -1385,14 +1447,22 @@ def is_mode_help_command(command: str) -> bool:
     return "模式" in command and command_contains_any(command, {"哪些", "什么", "有啥", "怎么", "功能"})
 
 
-def is_confirm_command(command: str) -> bool:
+def is_question_like_command(command: str) -> bool:
+    return command_contains_any(command, QUESTION_LIKE_KEYWORDS)
+
+
+def is_confirm_command(command: str, *, has_draft: bool = True) -> bool:
+    if is_question_like_command(command):
+        return False
     if command in ORDER_CONFIRM_COMMANDS:
         return True
     if command_contains_any(command, {"取消", "撤回", "不对", "不是", "别", "不要"}):
         return False
-    if command_contains_any(command, CONFIRM_LIKE_KEYWORDS):
+    if not has_draft:
+        return False
+    if command in SOFT_CONFIRM_COMMANDS:
         return True
-    return command in {"ok", "okay", "yes", "y"}
+    return False
 
 
 def is_order_storage_query_command(command: str) -> bool:
@@ -1407,6 +1477,65 @@ def mode_display_name(mode: str) -> str:
     return "普通聊天模式"
 
 
+def draft_mode_display_name(mode: str) -> str:
+    if mode == SESSION_MODE_ORDER:
+        return "订单草稿"
+    if mode == SESSION_MODE_RECEIPT:
+        return "入库草稿"
+    return "业务草稿"
+
+
+def has_raw_order_draft(record: dict[str, Any]) -> bool:
+    draft = record.get("order_draft")
+    return isinstance(draft, dict) and order_draft_has_content(normalize_order_draft(draft))
+
+
+def has_raw_receipt_draft(record: dict[str, Any]) -> bool:
+    draft = record.get("receipt_draft")
+    return isinstance(draft, dict) and receipt_draft_has_content(normalize_receipt_payload(draft))
+
+
+def conflicting_draft_mode_for_record(record: dict[str, Any], target_mode: str) -> str | None:
+    if target_mode == SESSION_MODE_ORDER and has_raw_receipt_draft(record):
+        return SESSION_MODE_RECEIPT
+    if target_mode == SESSION_MODE_RECEIPT and has_raw_order_draft(record):
+        return SESSION_MODE_ORDER
+    return None
+
+
+def business_mode_switch_blocked_reply(conflict_mode: str, target_mode: str) -> str:
+    return (
+        f"现在还有一份{draft_mode_display_name(conflict_mode)}待确认，"
+        f"我先不切到{mode_display_name(target_mode)}，避免把数据记串。"
+        "请先回复“确认”保存，或发“取消/退出”清掉后再切换。"
+    )
+
+
+def switch_session_mode(user_id: str, mode: str, *, clear_drafts: bool = False) -> None:
+    if mode not in SESSION_MODES:
+        raise ValueError(f"Invalid session mode: {mode}")
+
+    record = get_session_record(user_id)
+    record["mode"] = mode
+    if clear_drafts or mode == SESSION_MODE_INTERVIEW:
+        record.pop("order_draft", None)
+        record.pop("receipt_draft", None)
+    elif mode == SESSION_MODE_ORDER:
+        record.pop("receipt_draft", None)
+    elif mode == SESSION_MODE_RECEIPT:
+        record.pop("order_draft", None)
+    save_session_record(user_id, record)
+
+
+def try_switch_business_mode(user_id: str, target_mode: str) -> str | None:
+    record = get_session_record(user_id)
+    conflict_mode = conflicting_draft_mode_for_record(record, target_mode)
+    if conflict_mode:
+        return business_mode_switch_blocked_reply(conflict_mode, target_mode)
+    switch_session_mode(user_id, target_mode)
+    return None
+
+
 def clear_current_business_draft(user_id: str, mode: str | None = None) -> None:
     mode = mode or get_session_mode(user_id)
     record = get_session_record(user_id)
@@ -1417,6 +1546,7 @@ def clear_current_business_draft(user_id: str, mode: str | None = None) -> None:
     else:
         record.pop("order_draft", None)
         record.pop("receipt_draft", None)
+        record["mode"] = SESSION_MODE_INTERVIEW
     save_session_record(user_id, record)
 
 
@@ -1437,11 +1567,16 @@ def exit_business_mode(user_id: str) -> str:
 def build_status_message(user_id: str) -> str:
     mode = get_session_mode(user_id)
     record = get_session_record(user_id)
-    draft_text = "没有待确认草稿"
-    if isinstance(record.get("order_draft"), dict):
+    has_order = has_raw_order_draft(record)
+    has_receipt = has_raw_receipt_draft(record)
+    if has_order and has_receipt:
+        draft_text = "同时发现订单和入库草稿，请先发“取消/退出”清掉后重来"
+    elif has_order:
         draft_text = "有一份订单草稿待确认"
-    if isinstance(record.get("receipt_draft"), dict):
+    elif has_receipt:
         draft_text = "有一份入库草稿待确认"
+    else:
+        draft_text = "没有待确认草稿"
     return f"你现在在{mode_display_name(mode)}，{draft_text}。"
 
 
@@ -1500,6 +1635,126 @@ def looks_like_order_message(message: str) -> bool:
     return False
 
 
+def looks_like_receipt_business_message(message: str) -> bool:
+    command = normalize_command(message)
+    if is_business_query_or_negated(command) or is_question_like_command(command):
+        return False
+    if "入库" in command and command_contains_any(command, {"产成品", "成品", "车间", "照片", "图片", "清单", "记录", "记一下"}):
+        return True
+    return command_contains_any(command, {"产成品", "成品"}) and command_contains_any(command, {"照片", "图片", "车间", "入库"})
+
+
+def safe_extract_json_object(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return {}
+        try:
+            data = json.loads(raw[start : end + 1])
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
+def build_global_business_route_messages(message: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你只判断微信客服消息应该走哪条业务路由，不执行任何业务动作。"
+                "只能输出 JSON，格式 {\"route\":\"...\",\"confidence\":0.0,\"reason\":\"...\"}。"
+                "route 只能是 chat、order_text、enter_order、enter_receipt、order_query、unclear。"
+                "order_text=用户直接给了门店/商品/数量等订单内容；"
+                "enter_order=用户明确要进入录单/下单模式但未给订单明细；"
+                "enter_receipt=用户明确要记录产成品/车间入库；"
+                "order_query=用户查询订单库/同步/拉取结果；"
+                "chat=普通客服闲聊或业务咨询；unclear=不确定。"
+                "确认、取消、退出、撤回不能由你决定，遇到这类只输出 chat 或 unclear。"
+                "不要输出解释文本，不要输出 Markdown。"
+            ),
+        },
+        {"role": "user", "content": message},
+    ]
+
+
+def call_global_business_route_llm(messages: list[dict[str, str]]) -> str:
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def parse_global_business_route(raw_text: str) -> BusinessIntent:
+    data = safe_extract_json_object(raw_text)
+    route = str(data.get("route") or data.get("intent") or "").strip().lower()
+    if route not in {
+        GLOBAL_ROUTE_CHAT,
+        GLOBAL_ROUTE_ORDER_TEXT,
+        GLOBAL_ROUTE_ENTER_ORDER,
+        GLOBAL_ROUTE_ENTER_RECEIPT,
+        GLOBAL_ROUTE_ORDER_QUERY,
+        GLOBAL_ROUTE_UNCLEAR,
+    }:
+        return BusinessIntent(GLOBAL_ROUTE_UNCLEAR, 0.0, "llm", "invalid route")
+    try:
+        confidence = float(data.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    return BusinessIntent(route, confidence, "llm", str(data.get("reason") or "")[:160])
+
+
+def should_call_global_business_route_llm(message: str) -> bool:
+    command = normalize_command(message)
+    if is_question_like_command(command) and not command_contains_any(command, {"订单", "入库", "产成品", "成品"}):
+        return False
+    return command_contains_any(
+        command,
+        {"订单", "下单", "录单", "加单", "门店", "商品", "订", "入库", "产成品", "成品", "车间", "照片", "图片"},
+    ) or bool(re.search(r"\d+(?:\.\d+)?\s*(箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)", message))
+
+
+def classify_global_business_route(message: str) -> BusinessIntent:
+    command = normalize_command(message)
+    if is_order_storage_query_command(command):
+        return BusinessIntent(GLOBAL_ROUTE_ORDER_QUERY, 0.95, "rule", "order storage query")
+    if command_contains_any(command, BUSINESS_NEGATION_KEYWORDS):
+        return BusinessIntent(GLOBAL_ROUTE_CHAT, 0.75, "rule", "business negation")
+    if looks_like_order_message(message):
+        return BusinessIntent(GLOBAL_ROUTE_ORDER_TEXT, 0.92, "rule", "order-like text")
+    if looks_like_receipt_business_message(message):
+        return BusinessIntent(GLOBAL_ROUTE_ENTER_RECEIPT, 0.9, "rule", "receipt-like text")
+    if is_order_mode_command(command):
+        return BusinessIntent(GLOBAL_ROUTE_ENTER_ORDER, 0.92, "rule", "order mode command")
+    if is_receipt_mode_command(command):
+        return BusinessIntent(GLOBAL_ROUTE_ENTER_RECEIPT, 0.92, "rule", "receipt mode command")
+    if not should_call_global_business_route_llm(message):
+        return BusinessIntent(GLOBAL_ROUTE_CHAT, 0.7, "rule", "no business route signal")
+
+    try:
+        route = parse_global_business_route(call_global_business_route_llm(build_global_business_route_messages(message)))
+    except Exception:
+        return BusinessIntent(GLOBAL_ROUTE_UNCLEAR, 0.0, "llm_error", "route classifier failed")
+
+    if route.intent in {GLOBAL_ROUTE_ORDER_TEXT, GLOBAL_ROUTE_ENTER_ORDER, GLOBAL_ROUTE_ENTER_RECEIPT, GLOBAL_ROUTE_ORDER_QUERY} and route.confidence >= 0.78:
+        return route
+    if route.intent == GLOBAL_ROUTE_CHAT and route.confidence >= 0.85:
+        return route
+    return BusinessIntent(GLOBAL_ROUTE_UNCLEAR, route.confidence, route.source, route.reason)
+
+
 def append_mode_hint(answer: str, mode: str) -> str:
     answer = answer.strip()
     if mode == SESSION_MODE_ORDER:
@@ -1555,12 +1810,7 @@ def get_session_mode(user_id: str) -> str:
 
 
 def set_session_mode(user_id: str, mode: str) -> None:
-    if mode not in SESSION_MODES:
-        raise ValueError(f"Invalid session mode: {mode}")
-
-    record = get_session_record(user_id)
-    record["mode"] = mode
-    save_session_record(user_id, record)
+    switch_session_mode(user_id, mode)
 
 
 def get_order_draft(user_id: str) -> dict[str, Any]:
@@ -1574,13 +1824,18 @@ def save_order_draft(user_id: str, draft: dict[str, Any]) -> None:
     record = get_session_record(user_id)
     record["mode"] = SESSION_MODE_ORDER
     record["order_draft"] = normalize_order_draft(draft)
+    record.pop("receipt_draft", None)
     save_session_record(user_id, record)
 
 
-def clear_order_draft(user_id: str) -> None:
+def clear_order_draft(user_id: str, *, next_mode: str = SESSION_MODE_ORDER) -> None:
+    if next_mode not in SESSION_MODES:
+        raise ValueError(f"Invalid session mode: {next_mode}")
     record = get_session_record(user_id)
-    record["mode"] = SESSION_MODE_ORDER
+    record["mode"] = next_mode
     record.pop("order_draft", None)
+    if next_mode == SESSION_MODE_INTERVIEW:
+        record.pop("receipt_draft", None)
     save_session_record(user_id, record)
 
 
@@ -1595,13 +1850,18 @@ def save_receipt_draft(user_id: str, draft: dict[str, Any]) -> None:
     record = get_session_record(user_id)
     record["mode"] = SESSION_MODE_RECEIPT
     record["receipt_draft"] = normalize_receipt_payload(draft)
+    record.pop("order_draft", None)
     save_session_record(user_id, record)
 
 
-def clear_receipt_draft(user_id: str) -> None:
+def clear_receipt_draft(user_id: str, *, next_mode: str = SESSION_MODE_RECEIPT) -> None:
+    if next_mode not in SESSION_MODES:
+        raise ValueError(f"Invalid session mode: {next_mode}")
     record = get_session_record(user_id)
-    record["mode"] = SESSION_MODE_RECEIPT
+    record["mode"] = next_mode
     record.pop("receipt_draft", None)
+    if next_mode == SESSION_MODE_INTERVIEW:
+        record.pop("order_draft", None)
     save_session_record(user_id, record)
 
 
@@ -1983,6 +2243,54 @@ def business_confirm_clarification(*, receipt: bool = False) -> str:
     return f"我不确定你是不是要保存{subject}。确认无误请回“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
 
 
+def parse_simple_order_replacement(message: str) -> tuple[str, str] | None:
+    text = clean_order_value(message).strip(" ，,。.;；")
+    match = re.fullmatch(r"(?:把)?(.{1,80}?)(?:改成|改为|换成|替换成|变成)(.{1,80})", text)
+    if not match:
+        return None
+
+    old_value = clean_order_value(match.group(1)).strip(" '\"“”‘’，,。.;；")
+    new_value = clean_order_value(match.group(2)).strip(" '\"“”‘’，,。.;；")
+    if not old_value or not new_value or old_value == new_value:
+        return None
+    return old_value, new_value
+
+
+def replace_text_field(container: dict[str, Any], key: str, old_value: str, new_value: str) -> bool:
+    value = container.get(key)
+    if not isinstance(value, str) or old_value not in value:
+        return False
+    container[key] = value.replace(old_value, new_value)
+    return True
+
+
+def apply_simple_order_draft_modification(draft: dict[str, Any], message: str) -> dict[str, Any] | None:
+    replacement = parse_simple_order_replacement(message)
+    if not replacement:
+        return None
+
+    old_value, new_value = replacement
+    updated = json.loads(json.dumps(draft, ensure_ascii=False))
+    changed = False
+    for key in ("store", "order_no", "orderer", "deliver_date", "order_date", "raw_text"):
+        changed = replace_text_field(updated, key, old_value, new_value) or changed
+
+    items = updated.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("code", "name", "spec", "unit", "category"):
+                changed = replace_text_field(item, key, old_value, new_value) or changed
+
+    if not changed:
+        return None
+
+    updated["confirmed"] = False
+    updated["status"] = ORDER_STATUS_NEW
+    return normalize_order_draft(updated)
+
+
 def save_confirmed_order_response(user_id: str, draft: dict[str, Any], history_length: int) -> ChatResponse:
     if not order_draft_has_content(draft):
         return ChatResponse(
@@ -2104,13 +2412,55 @@ def excel_header_key(value: Any) -> str | None:
         for alias in aliases:
             if normalized == normalize_excel_header(alias):
                 return key
+
+    if normalized in {"商品名称规格型号", "产品名称规格", "货品名称规格", "物料名称规格"}:
+        return "name"
+    if normalized.startswith("商品名称") and "编码" not in normalized and "代码" not in normalized:
+        return "name"
+    if normalized.startswith("品名") or normalized.startswith("产品名称") or normalized.startswith("货品名称"):
+        return "name"
+    if normalized.endswith("门店") or normalized.endswith("店铺"):
+        return "store"
+    if normalized.startswith("订货数量") or normalized.startswith("订购数量") or normalized.startswith("下单数量"):
+        return "qty"
+    if normalized.startswith("数量") and not normalized.startswith("数量合计"):
+        return "qty"
+    if normalized.endswith("数量") and not normalized.endswith("订单数量"):
+        return "qty"
     return None
+
+
+def excel_qty_unit_from_header(value: Any) -> str:
+    text = clean_order_value(value)
+    if not text:
+        return ""
+    bracket_match = re.search(r"[（(]\s*([^）)]+?)\s*[）)]", text)
+    if bracket_match:
+        unit = clean_order_value(bracket_match.group(1)).strip()
+        if unit and len(unit) <= 8:
+            return unit
+    normalized = normalize_excel_header(text)
+    for unit in ("箱", "件", "袋", "盒", "包", "斤", "公斤", "kg", "KG", "份", "个", "瓶", "桶", "条", "只"):
+        if normalized.endswith(unit.lower()) or normalized.endswith(unit):
+            return unit
+    return ""
+
+
+def excel_header_units(row: tuple[Any, ...], header_map: dict[int, str]) -> dict[str, str]:
+    units: dict[str, str] = {}
+    for index, key in header_map.items():
+        if key == "qty" and index < len(row):
+            unit = excel_qty_unit_from_header(row[index])
+            if unit:
+                units[key] = unit
+    return units
 
 
 def find_excel_header_row(rows: list[tuple[Any, ...]]) -> tuple[int, dict[int, str]]:
     best_index = -1
     best_map: dict[int, str] = {}
     best_score = 0
+    best_has_required = False
     for index, row in enumerate(rows[:30]):
         header_map: dict[int, str] = {}
         for column_index, value in enumerate(row):
@@ -2118,14 +2468,26 @@ def find_excel_header_row(rows: list[tuple[Any, ...]]) -> tuple[int, dict[int, s
             if key and key not in header_map.values():
                 header_map[column_index] = key
         score = len(header_map)
-        if score > best_score:
+        has_required = "name" in header_map.values() and "qty" in header_map.values()
+        if (has_required and not best_has_required) or (has_required == best_has_required and score > best_score):
             best_index = index
             best_map = header_map
             best_score = score
+            best_has_required = has_required
 
-    if best_score < 2 or "name" not in best_map.values() or "qty" not in best_map.values():
+    if best_score < 2 or not best_has_required:
         raise ValueError("Excel header row not found; expected product name and quantity columns")
     return best_index, best_map
+
+
+def is_excel_metadata_label(value: Any) -> bool:
+    value_text = normalize_excel_header(value)
+    if not value_text:
+        return False
+    for labels in EXCEL_METADATA_LABELS.values():
+        if any(value_text == normalize_excel_header(label) for label in labels):
+            return True
+    return False
 
 
 def extract_excel_metadata(rows: list[tuple[Any, ...]], header_index: int) -> dict[str, Any]:
@@ -2142,10 +2504,12 @@ def extract_excel_metadata(rows: list[tuple[Any, ...]], header_index: int) -> di
                 for label in labels:
                     label_text = normalize_excel_header(label)
                     value_text = normalize_excel_header(text)
-                    if value_text == label_text and index + 1 < len(cells):
+                    if value_text == label_text and index + 1 < len(cells) and not is_excel_metadata_label(cells[index + 1]):
                         metadata[field] = cells[index + 1]
-                    elif value_text.startswith(label_text) and len(text) > len(label):
-                        metadata[field] = re.sub(rf"^{re.escape(label)}\s*[：: ]*", "", text).strip()
+                    else:
+                        inline_match = re.match(rf"^\s*{re.escape(label)}\s*[：:]\s*(.+?)\s*$", text)
+                        if inline_match:
+                            metadata[field] = inline_match.group(1)
     return metadata
 
 
@@ -2156,15 +2520,28 @@ def row_value_by_header(row: tuple[Any, ...], header_map: dict[int, str], field:
     return None
 
 
+def find_excel_order_rows(workbook: Any) -> tuple[list[tuple[Any, ...]], int, dict[int, str]]:
+    last_error: ValueError | None = None
+    for sheet in workbook.worksheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            continue
+        try:
+            header_index, header_map = find_excel_header_row(rows)
+        except ValueError as exc:
+            last_error = exc
+            continue
+        return rows, header_index, header_map
+    if last_error:
+        raise last_error
+    raise ValueError("Excel file is empty")
+
+
 def parse_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str, Any]]:
     workbook = load_workbook(BytesIO(file_bytes), data_only=True)
-    sheet = workbook.active
-    rows = list(sheet.iter_rows(values_only=True))
-    if not rows:
-        raise ValueError("Excel file is empty")
-
-    header_index, header_map = find_excel_header_row(rows)
+    rows, header_index, header_map = find_excel_order_rows(workbook)
     metadata = extract_excel_metadata(rows, header_index)
+    header_units = excel_header_units(rows[header_index], header_map)
     grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
 
     for row in rows[header_index + 1 :]:
@@ -2172,7 +2549,7 @@ def parse_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str
             "code": row_value_by_header(row, header_map, "code"),
             "name": row_value_by_header(row, header_map, "name"),
             "spec": row_value_by_header(row, header_map, "spec"),
-            "unit": row_value_by_header(row, header_map, "unit"),
+            "unit": row_value_by_header(row, header_map, "unit") or header_units.get("qty"),
             "qty": row_value_by_header(row, header_map, "qty"),
             "price": row_value_by_header(row, header_map, "price"),
             "category": row_value_by_header(row, header_map, "category"),
@@ -3008,20 +3385,20 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
     has_existing_draft = order_draft_has_content(existing_draft)
 
     if command in ORDER_CANCEL_COMMANDS:
-        clear_order_draft(user_id)
+        clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
         return ChatResponse(
             user_id=user_id,
-            answer="已清空当前订单草稿。你可以直接发送下一张订单。",
+            answer="已清空当前订单草稿，并回到普通聊天。要继续录单再发“订单”。",
             history_length=history_length,
         )
 
     if has_existing_draft:
         intent = classify_order_reply_intent(message, existing_draft)
         if intent.intent == INTENT_CANCEL and intent.is_rule:
-            clear_order_draft(user_id)
+            clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
             return ChatResponse(
                 user_id=user_id,
-                answer="已清空当前订单草稿。你可以直接发送下一张订单。",
+                answer="已清空当前订单草稿，并回到普通聊天。要继续录单再发“订单”。",
                 history_length=history_length,
             )
         if intent.intent == INTENT_EXIT and intent.is_rule:
@@ -3038,6 +3415,25 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 answer="这单我先不保存。要修改就直接发修改内容；发“取消”可以清空草稿。",
                 history_length=history_length,
             )
+        if intent.intent == INTENT_MODIFY:
+            updated_draft = apply_simple_order_draft_modification(existing_draft, message)
+            if updated_draft:
+                save_order_draft(user_id, updated_draft)
+                missing = order_draft_missing_fields(updated_draft)
+                summary = format_order_draft_summary(updated_draft)
+                if missing:
+                    answer = missing_fields_reply(missing)
+                else:
+                    answer = (
+                        "已按你的修改更新订单草稿：\n"
+                        + summary
+                        + "\n确认无误请回复“确认 / 对 / ok / yes”；要继续修改就直接发修改内容。"
+                    )
+                return ChatResponse(
+                    user_id=user_id,
+                    answer=answer,
+                    history_length=history_length,
+                )
         if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT} and not looks_like_order_message(message):
             return ChatResponse(
                 user_id=user_id,
@@ -3113,6 +3509,48 @@ def format_receipt_draft_summary(draft: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def apply_simple_receipt_draft_modification(draft: dict[str, Any], message: str) -> dict[str, Any] | None:
+    if not receipt_draft_has_content(draft):
+        return None
+
+    updated = json.loads(json.dumps(draft, ensure_ascii=False))
+    changed = False
+    command = normalize_command(message)
+
+    replacement = parse_simple_order_replacement(message)
+    if replacement:
+        old_value, new_value = replacement
+        changed = replace_text_field(updated, "date", old_value, new_value) or changed
+        items = updated.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("code", "name", "spec", "unit"):
+                    changed = replace_text_field(item, key, old_value, new_value) or changed
+
+    date_match = re.search(r"(?:日期|入库日期)(?:是|改成|改为|换成|:|：)?\s*([0-9]{1,4}[.\-/年月][0-9]{1,2}(?:[.\-/月][0-9]{1,2})?(?:日)?)", message)
+    if date_match:
+        date_value = normalize_order_date_text(date_match.group(1))
+        if date_value:
+            updated["date"] = date_value
+            changed = True
+
+    items = updated.get("items")
+    qty_match = re.search(r"(\d+(?:\.\d+)?)\s*(箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)?", message)
+    if isinstance(items, list) and len(items) == 1 and qty_match and command_contains_any(command, {"数量", "改成", "改为", "换成"}):
+        item = items[0]
+        if isinstance(item, dict):
+            item["qty"] = normalize_number(qty_match.group(1))
+            if qty_match.group(2):
+                item["unit"] = qty_match.group(2)
+            changed = True
+
+    if not changed:
+        return None
+    return normalize_receipt_payload(updated)
+
+
 def classify_receipt_reply_intent(message: str, draft: dict[str, Any]) -> BusinessIntent:
     return classify_business_intent(
         message,
@@ -3161,20 +3599,20 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
     draft = get_receipt_draft(user_id)
     has_existing_draft = receipt_draft_has_content(draft)
     if command in ORDER_CANCEL_COMMANDS:
-        clear_receipt_draft(user_id)
+        clear_receipt_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
         return ChatResponse(
             user_id=user_id,
-            answer="已清空当前入库草稿。请重新发送产成品入库照片。",
+            answer="已清空当前入库草稿，并回到普通聊天。要继续入库再发“入库”。",
             history_length=0,
         )
 
     if has_existing_draft:
         intent = classify_receipt_reply_intent(message, draft)
         if intent.intent == INTENT_CANCEL and intent.is_rule:
-            clear_receipt_draft(user_id)
+            clear_receipt_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
             return ChatResponse(
                 user_id=user_id,
-                answer="已清空当前入库草稿。请重新发送产成品入库照片。",
+                answer="已清空当前入库草稿，并回到普通聊天。要继续入库再发“入库”。",
                 history_length=0,
             )
         if intent.intent == INTENT_EXIT and intent.is_rule:
@@ -3189,6 +3627,26 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
             return ChatResponse(
                 user_id=user_id,
                 answer="这条入库记录我先不保存。要修改请重新发送照片；发“取消”可以清空草稿。",
+                history_length=0,
+            )
+        if intent.intent == INTENT_MODIFY:
+            updated_draft = apply_simple_receipt_draft_modification(draft, message)
+            if updated_draft:
+                save_receipt_draft(user_id, updated_draft)
+                missing = receipt_missing_fields(updated_draft)
+                summary = format_receipt_draft_summary(updated_draft)
+                if missing:
+                    answer = missing_fields_reply(missing, receipt=True)
+                else:
+                    answer = (
+                        "已按你的修改更新入库草稿：\n"
+                        + summary
+                        + "\n确认无误请回复“确认 / 对 / ok / yes”；要继续修改就直接发修改内容。"
+                    )
+                return ChatResponse(user_id=user_id, answer=answer, history_length=0)
+            return ChatResponse(
+                user_id=user_id,
+                answer="入库草稿这条修改我没合并稳。请重新发送照片，或发“取消”清空后重来。",
                 history_length=0,
             )
         if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT}:
@@ -3309,6 +3767,10 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
     command = normalize_command(message)
     inline_order_message = strip_order_inline_prefix(message)
     current_mode = get_session_mode(user_id)
+    record = get_session_record(user_id)
+    has_order_draft = has_raw_order_draft(record)
+    has_receipt_draft = has_raw_receipt_draft(record)
+    has_any_draft = has_order_draft or has_receipt_draft
 
     if command in ORDER_EXPORT_COMMANDS:
         return ChatResponse(
@@ -3331,22 +3793,6 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             history_length=user_order_count(user_id),
         )
 
-    if is_order_mode_command(command):
-        set_session_mode(user_id, SESSION_MODE_ORDER)
-        return ChatResponse(
-            user_id=user_id,
-            answer="好的，进入订单模式了，直接发订单文字、Excel 或照片都行，发“退出”就退出。",
-            history_length=user_order_count(user_id),
-        )
-
-    if is_receipt_mode_command(command):
-        set_session_mode(user_id, SESSION_MODE_RECEIPT)
-        return ChatResponse(
-            user_id=user_id,
-            answer="好的，进入入库模式了，发产成品入库照片就行，发“退出”就退出。",
-            history_length=0,
-        )
-
     if is_exit_mode_command(command) or command in INTERVIEW_MODE_COMMANDS:
         return ChatResponse(
             user_id=user_id,
@@ -3355,28 +3801,57 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         )
 
     if command in ORDER_CANCEL_COMMANDS:
-        if current_mode == SESSION_MODE_RECEIPT:
-            clear_receipt_draft(user_id)
-            answer = "已清空当前入库草稿，入库模式还在。"
-        elif current_mode == SESSION_MODE_ORDER:
-            clear_order_draft(user_id)
-            answer = "已清空当前订单草稿，订单模式还在。"
+        if has_receipt_draft and not has_order_draft:
+            clear_receipt_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+            answer = "已清空当前入库草稿，并回到普通聊天。"
+        elif has_order_draft and not has_receipt_draft:
+            clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+            answer = "已清空当前订单草稿，并回到普通聊天。"
         else:
             record = get_session_record(user_id)
             record.pop("order_draft", None)
             record.pop("receipt_draft", None)
+            record["mode"] = SESSION_MODE_INTERVIEW
             save_session_record(user_id, record)
-            answer = "已清空当前草稿。"
+            answer = "已清空当前草稿，并回到普通聊天。"
         return ChatResponse(user_id=user_id, answer=answer, history_length=0)
 
     if is_revoke_command(command):
-        if current_mode == SESSION_MODE_RECEIPT:
+        if current_mode == SESSION_MODE_RECEIPT or is_receipt_revoke_target(command):
             answer = cancel_latest_receipt_for_user(user_id)
         else:
             answer = cancel_latest_order_for_user(user_id)
         return ChatResponse(user_id=user_id, answer=answer, history_length=user_order_count(user_id))
 
-    if is_confirm_command(command):
+    if needs_human_transfer(message):
+        return ChatResponse(user_id=user_id, answer="这个我不瞎承诺，我帮您转人工处理。", history_length=0)
+
+    if has_order_draft and has_receipt_draft:
+        return ChatResponse(
+            user_id=user_id,
+            answer="我发现当前同时有订单草稿和入库草稿，状态不安全。请发“取消”清空后重新录入，避免把数据记串。",
+            history_length=0,
+        )
+
+    if is_order_mode_command(command) and has_receipt_draft:
+        return ChatResponse(
+            user_id=user_id,
+            answer=business_mode_switch_blocked_reply(SESSION_MODE_RECEIPT, SESSION_MODE_ORDER),
+            history_length=0,
+        )
+    if is_receipt_mode_command(command) and has_order_draft:
+        return ChatResponse(
+            user_id=user_id,
+            answer=business_mode_switch_blocked_reply(SESSION_MODE_ORDER, SESSION_MODE_RECEIPT),
+            history_length=user_order_count(user_id),
+        )
+
+    if has_order_draft:
+        return handle_order_user_message(user_id, message, raw_ref=raw_ref)
+    if has_receipt_draft:
+        return handle_receipt_user_message(user_id, message)
+
+    if is_confirm_command(command, has_draft=has_any_draft):
         if current_mode == SESSION_MODE_ORDER:
             return handle_order_user_message(user_id, message, raw_ref=raw_ref)
         if current_mode == SESSION_MODE_RECEIPT:
@@ -3387,7 +3862,27 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             history_length=0,
         )
 
-    if current_mode == SESSION_MODE_ORDER and is_order_storage_query_command(command):
+    if is_order_mode_command(command):
+        blocked = try_switch_business_mode(user_id, SESSION_MODE_ORDER)
+        if blocked:
+            return ChatResponse(user_id=user_id, answer=blocked, history_length=user_order_count(user_id))
+        return ChatResponse(
+            user_id=user_id,
+            answer="好的，进入订单模式了，直接发订单文字、Excel 或照片都行，发“退出”就退出。",
+            history_length=user_order_count(user_id),
+        )
+
+    if is_receipt_mode_command(command):
+        blocked = try_switch_business_mode(user_id, SESSION_MODE_RECEIPT)
+        if blocked:
+            return ChatResponse(user_id=user_id, answer=blocked, history_length=0)
+        return ChatResponse(
+            user_id=user_id,
+            answer="好的，进入入库模式了，发产成品入库照片就行，发“退出”就退出。",
+            history_length=0,
+        )
+
+    if is_order_storage_query_command(command):
         return ChatResponse(
             user_id=user_id,
             answer=build_order_storage_query_reply(user_id),
@@ -3395,20 +3890,49 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         )
 
     if inline_order_message is not None:
-        set_session_mode(user_id, SESSION_MODE_ORDER)
+        blocked = try_switch_business_mode(user_id, SESSION_MODE_ORDER)
+        if blocked:
+            return ChatResponse(user_id=user_id, answer=blocked, history_length=user_order_count(user_id))
         return handle_order_user_message(user_id, inline_order_message, raw_ref=raw_ref)
 
     if current_mode == SESSION_MODE_ORDER:
-        if order_draft_has_content(get_order_draft(user_id)):
-            return handle_order_user_message(user_id, message, raw_ref=raw_ref)
         if looks_like_order_message(message):
             return handle_order_user_message(user_id, message, raw_ref=raw_ref)
         return handle_general_chat(user_id, message, mode_hint=SESSION_MODE_ORDER)
 
     if current_mode == SESSION_MODE_RECEIPT:
-        if receipt_draft_has_content(get_receipt_draft(user_id)):
-            return handle_receipt_user_message(user_id, message)
         return handle_general_chat(user_id, message, mode_hint=SESSION_MODE_RECEIPT)
+
+    route = classify_global_business_route(message)
+    if route.intent == GLOBAL_ROUTE_ORDER_TEXT:
+        blocked = try_switch_business_mode(user_id, SESSION_MODE_ORDER)
+        if blocked:
+            return ChatResponse(user_id=user_id, answer=blocked, history_length=user_order_count(user_id))
+        return handle_order_user_message(user_id, message, raw_ref=raw_ref)
+    if route.intent == GLOBAL_ROUTE_ENTER_ORDER:
+        blocked = try_switch_business_mode(user_id, SESSION_MODE_ORDER)
+        if blocked:
+            return ChatResponse(user_id=user_id, answer=blocked, history_length=user_order_count(user_id))
+        return ChatResponse(
+            user_id=user_id,
+            answer="好的，进入订单模式了，直接发订单文字、Excel 或照片都行，发“退出”就退出。",
+            history_length=user_order_count(user_id),
+        )
+    if route.intent == GLOBAL_ROUTE_ENTER_RECEIPT:
+        blocked = try_switch_business_mode(user_id, SESSION_MODE_RECEIPT)
+        if blocked:
+            return ChatResponse(user_id=user_id, answer=blocked, history_length=0)
+        return ChatResponse(
+            user_id=user_id,
+            answer="好的，进入入库模式了，发产成品入库照片就行，发“退出”就退出。",
+            history_length=0,
+        )
+    if route.intent == GLOBAL_ROUTE_ORDER_QUERY:
+        return ChatResponse(
+            user_id=user_id,
+            answer=build_order_storage_query_reply(user_id),
+            history_length=user_order_count(user_id),
+        )
 
     return handle_general_chat(user_id, message)
 

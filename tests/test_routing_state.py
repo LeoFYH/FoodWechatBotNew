@@ -1,0 +1,151 @@
+import importlib
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+class RoutingStateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        root = Path(self.tempdir.name)
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "LLM_API_KEY": "dummy",
+                "DATABASE_BACKEND": "sqlite",
+                "MEMORY_FILE": str(root / "memory.json"),
+                "SESSION_STATE_FILE": str(root / "session_state.json"),
+                "ORDER_DB_FILE": str(root / "orders.db"),
+                "RECEIPT_DB_FILE": str(root / "receipts.db"),
+                "INTERVIEW_ARCHIVE_FILE": str(root / "interviews.json"),
+                "WECOM_KF_CURSOR_FILE": str(root / "kf_cursors.json"),
+                "EXPORT_DIR": str(root / "exports"),
+            },
+            clear=False,
+        )
+        self.env_patch.start()
+        os.environ.pop("VISION_API_KEY", None)
+        sys.modules.pop("main", None)
+        self.main = importlib.import_module("main")
+
+    def tearDown(self) -> None:
+        sys.modules.pop("main", None)
+        self.env_patch.stop()
+        self.tempdir.cleanup()
+
+    def stub_chat(self):
+        return patch.object(self.main, "call_customer_chat_llm", return_value="普通回复")
+
+    def test_question_with_confirm_word_transfers_to_human(self) -> None:
+        response = self.main.handle_user_message("u1", "发票可以开吗")
+        self.assertIn("转人工", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+
+    def test_order_query_does_not_switch_to_order_mode(self) -> None:
+        response = self.main.handle_user_message("u1", "查一下订单")
+        self.assertIn("订单只有", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+
+    def test_negated_receipt_text_does_not_enter_receipt_mode(self) -> None:
+        with self.stub_chat():
+            response = self.main.handle_user_message("u1", "不要入库")
+        self.assertEqual(response.answer, "普通回复")
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+
+    def test_plain_order_text_routes_to_order_parser(self) -> None:
+        expected = self.main.ChatResponse(user_id="u1", answer="订单解析", history_length=0)
+        with patch.object(self.main, "handle_order_user_message", return_value=expected) as handler:
+            response = self.main.handle_user_message("u1", "老三家 鸡腿 20件")
+        handler.assert_called_once()
+        self.assertEqual(response.answer, "订单解析")
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_ORDER)
+
+    def test_explicit_mode_commands_still_switch_modes(self) -> None:
+        order_response = self.main.handle_user_message("u1", "订单")
+        self.assertIn("进入订单模式", order_response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_ORDER)
+
+        receipt_response = self.main.handle_user_message("u2", "入库")
+        self.assertIn("进入入库模式", receipt_response.answer)
+        self.assertEqual(self.main.get_session_mode("u2"), self.main.SESSION_MODE_RECEIPT)
+
+    def test_llm_global_route_can_enter_order_mode(self) -> None:
+        with patch.object(
+            self.main,
+            "call_global_business_route_llm",
+            return_value='{"route":"enter_order","confidence":0.91,"reason":"要录订单"}',
+        ):
+            response = self.main.handle_user_message("u1", "门店要录一下")
+        self.assertIn("进入订单模式", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_ORDER)
+
+    def test_order_draft_blocks_switch_to_receipt(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+                "change_type": "add",
+            },
+        )
+        response = self.main.handle_user_message("u1", "入库")
+        self.assertIn("我先不切到入库模式", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_ORDER)
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
+
+    def test_save_order_draft_clears_receipt_draft(self) -> None:
+        self.main.save_receipt_draft(
+            "u1",
+            {"date": "2026-06-24", "items": [{"name": "鲜肉馄饨", "qty": 10, "unit": "箱"}]},
+        )
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+                "change_type": "add",
+            },
+        )
+        self.assertFalse(self.main.receipt_draft_has_content(self.main.get_receipt_draft("u1")))
+
+    def test_cancel_clears_draft_and_exits_business_mode(self) -> None:
+        self.main.save_order_draft(
+            "u1",
+            {
+                "kind": "patch",
+                "source": "text",
+                "store": "老三家",
+                "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+                "change_type": "add",
+            },
+        )
+        response = self.main.handle_user_message("u1", "取消")
+        self.assertIn("回到普通聊天", response.answer)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+        self.assertFalse(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
+
+    def test_receipt_modify_updates_single_item_quantity(self) -> None:
+        self.main.save_receipt_draft(
+            "u1",
+            {"date": "2026-06-24", "items": [{"name": "鲜肉馄饨", "qty": 10, "unit": "箱"}]},
+        )
+        response = self.main.handle_user_message("u1", "数量改成20件")
+        draft = self.main.get_receipt_draft("u1")
+        self.assertIn("已按你的修改更新入库草稿", response.answer)
+        self.assertEqual(draft["items"][0]["qty"], 20)
+        self.assertEqual(draft["items"][0]["unit"], "件")
+
+    def test_confirm_question_is_not_confirm_command(self) -> None:
+        self.assertFalse(self.main.is_confirm_command("发票可以开吗", has_draft=True))
+        self.assertFalse(self.main.is_confirm_command("这个可以吗", has_draft=True))
+
+
+if __name__ == "__main__":
+    unittest.main()

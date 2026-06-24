@@ -129,6 +129,7 @@ CONFIRM_STARTS = (
     "走吧",
     "就这样",
 )
+QUESTION_LIKE_KEYWORDS = {"吗", "么", "?", "？", "能不能", "可不可以", "是否", "怎么", "如何", "什么", "多少", "价格", "发票"}
 
 
 def looks_like_correction(text: str) -> bool:
@@ -137,6 +138,10 @@ def looks_like_correction(text: str) -> bool:
     if contains_any(text, {"不对", "不是", "错了", "有误"}) and re.search(r"\d|箱|件|袋|盒|包|斤|公斤|kg|克|门店|日期|下单|送", text):
         return True
     return False
+
+
+def looks_like_question(text: str) -> bool:
+    return contains_any(text, QUESTION_LIKE_KEYWORDS)
 
 
 def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
@@ -156,7 +161,7 @@ def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
         return BusinessIntent(INTENT_MODIFY, 0.92, "rule", "correction keyword")
     if contains_any(text, REJECT_KEYWORDS):
         return BusinessIntent(INTENT_REJECT, 0.92, "rule", "reject keyword")
-    if text in CONFIRM_EXACT or text.startswith(CONFIRM_STARTS):
+    if not looks_like_question(text) and (text in CONFIRM_EXACT or text.startswith(CONFIRM_STARTS)):
         return BusinessIntent(INTENT_CONFIRM, 0.95, "rule", "confirm phrase")
 
     return BusinessIntent(INTENT_UNCLEAR, 0.0, "rule", "needs llm")
