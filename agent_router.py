@@ -21,8 +21,10 @@ agent_router.py —— 消息分诊"大脑"（前门路由层）
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -75,33 +77,45 @@ class RouterDecision:
         return self.intent in ACTIONABLE_ROUTES
 
 
+ROUTING_SKILL_FILE = Path(
+    os.getenv("ROUTING_SKILL_FILE", str(Path(__file__).resolve().parent / "skills" / "routing" / "SKILL.md"))
+)
+
+# 文件缺失时的内置兜底（与 skills/routing/SKILL.md 同义），保证分诊不会因读不到文件而瘫痪。
+_DEFAULT_ROUTING_SKILL = (
+    "你是餐饮微信客服的消息分诊器。你只判断这条消息应该走哪条业务路由，"
+    "并尽量抽取关键信息，绝不执行任何业务动作。\n"
+    "只能输出 JSON，格式："
+    "{\"route\":\"...\",\"confidence\":0.0,\"reason\":\"...\",\"fields\":{}}。\n"
+    "route 只能是以下之一：\n"
+    "- order_text：用户直接给了订单内容（门店/商品/数量/日期等，哪怕表达很口语、很复杂）。\n"
+    "- enter_order：用户明确想进入录单/下单，但还没给订单明细。\n"
+    "- enter_receipt：用户要记录产成品/车间入库。\n"
+    "- order_query：用户查询订单库 / 同步 / 拉取结果。\n"
+    "- chat：普通客服闲聊或业务咨询。\n"
+    "- unclear：你无法确定。\n"
+    "fields 是可选的轻量抽取，命中 order_text 时尽量填，例如："
+    "{\"store\":\"鼓楼店\",\"deliver_date\":\"明天\",\"items\":[{\"name\":\"鲜肉馄饨\",\"quantity\":20}]}；拿不准就留空 {}。\n"
+    "重要：确认、取消、退出、撤回这些动作不归你决定，"
+    "遇到这类消息只输出 route 为 chat 或 unclear。\n"
+    "不要输出解释文本，不要输出 Markdown，只输出 JSON。"
+)
+
+
+def load_routing_skill() -> str:
+    """读取分诊 skill（规则 + 例子）。每次读取，改了 .md 立即生效；读不到则用内置兜底。"""
+    try:
+        text = ROUTING_SKILL_FILE.read_text(encoding="utf-8").strip()
+        return text or _DEFAULT_ROUTING_SKILL
+    except OSError:
+        return _DEFAULT_ROUTING_SKILL
+
+
 def build_route_messages(message: str, *, mode: str = "") -> list[dict[str, str]]:
-    """构造给大模型的分诊提示词：意图菜单 + 轻量抽取，只允许输出 JSON。"""
+    """构造给大模型的分诊提示词：skill 规则（可在 skills/routing/SKILL.md 改）+ 用户消息。"""
     mode_line = f"\n当前会话模式：{mode or 'unknown'}" if mode else ""
     return [
-        {
-            "role": "system",
-            "content": (
-                "你是餐饮微信客服的消息分诊器。你只判断这条消息应该走哪条业务路由，"
-                "并尽量抽取关键信息，绝不执行任何业务动作。\n"
-                "只能输出 JSON，格式："
-                "{\"route\":\"...\",\"confidence\":0.0,\"reason\":\"...\","
-                "\"fields\":{}}。\n"
-                "route 只能是以下之一：\n"
-                "- order_text：用户直接给了订单内容（门店/商品/数量/日期等，哪怕表达很口语、很复杂）。\n"
-                "- enter_order：用户明确想进入录单/下单，但还没给订单明细。\n"
-                "- enter_receipt：用户要记录产成品/车间入库。\n"
-                "- order_query：用户查询订单库 / 同步 / 拉取结果。\n"
-                "- chat：普通客服闲聊或业务咨询。\n"
-                "- unclear：你无法确定。\n"
-                "fields 是可选的轻量抽取，命中 order_text 时尽量填，例如："
-                "{\"store\":\"鼓楼店\",\"deliver_date\":\"明天\","
-                "\"items\":[{\"name\":\"鲜肉馄饨\",\"quantity\":20}]}；拿不准就留空 {}。\n"
-                "重要：确认、取消、退出、撤回这些动作不归你决定，"
-                "遇到这类消息只输出 route 为 chat 或 unclear。\n"
-                "不要输出解释文本，不要输出 Markdown，只输出 JSON。"
-            ),
-        },
+        {"role": "system", "content": load_routing_skill()},
         {"role": "user", "content": f"{message}{mode_line}"},
     ]
 
