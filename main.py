@@ -2589,6 +2589,70 @@ def apply_simple_order_draft_modification(draft: dict[str, Any], message: str) -
     return normalize_order_draft(updated)
 
 
+def order_modify_needs_llm(message: str) -> bool:
+    """判断是否“多项加/改”——这类脆规则会丢项或改错，应交给 LLM 整体解析。
+
+    触发条件（命中其一）：
+    - 出现 ≥2 个“改成/改为”：多项改量；
+    - 没有“各”(共享数量) 却出现 ≥2 个“数量+单位”：多项各自数量的加/改。
+    单项改动（单个数量、或“各X”共享数量）不触发，继续走便宜的规则路径。
+    """
+    text = str(message or "")
+    if len(re.findall(r"改成|改为", text)) >= 2:
+        return True
+    if "各" not in text:
+        qty_tokens = re.findall(r"\d+(?:\.\d+)?\s*(?:箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)", text)
+        if len(qty_tokens) >= 2:
+            return True
+    return False
+
+
+def merge_order_items(
+    existing_items: list[dict[str, Any]], patch_items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """把 LLM 解析出的改动项按“商品名”稳妥合并进现有明细：同名改量、新名追加。
+
+    合并由代码完成（不靠 LLM 复述未改动的旧项），避免旧商品被漏掉。
+    """
+    merged = [dict(item) for item in (existing_items or [])]
+    index = {str(item.get("name") or "").strip(): item for item in merged if item.get("name")}
+    for patch in patch_items or []:
+        name = str(patch.get("name") or "").strip()
+        if not name:
+            continue
+        target = index.get(name)
+        if target is not None:
+            if patch.get("qty") is not None:
+                target["qty"] = patch.get("qty")
+            if patch.get("unit"):
+                target["unit"] = patch.get("unit")
+        else:
+            new_item = dict(patch)
+            merged.append(new_item)
+            index[name] = new_item
+    return merged
+
+
+def llm_update_order_draft(existing_draft: dict[str, Any], message: str) -> dict[str, Any] | None:
+    """多项加/改：用 LLM 解析改动，再按商品名合并进现有草稿。
+
+    LLM 只负责把自然语言变成结构化改动项；合并旧明细由 merge_order_items（代码）完成，
+    所以即便表达复杂，旧商品也不会丢。失败由调用方兜底。
+    """
+    patch = llm_parse_order_draft(existing_draft, message)
+    patch_items = patch.get("items") if isinstance(patch, dict) else None
+    if not patch_items:
+        return None
+    merged = json.loads(json.dumps(existing_draft, ensure_ascii=False))
+    merged["items"] = merge_order_items(existing_draft.get("items") or [], patch_items)
+    for key in ("store", "order_date", "deliver_date"):
+        if not merged.get(key) and patch.get(key):
+            merged[key] = patch.get(key)
+    merged["confirmed"] = False
+    merged["status"] = ORDER_STATUS_NEW
+    return normalize_order_draft(merged)
+
+
 def save_confirmed_order_response(user_id: str, draft: dict[str, Any], history_length: int) -> ChatResponse:
     if not order_draft_has_content(draft):
         return ChatResponse(
@@ -4116,7 +4180,21 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 history_length=history_length,
             )
         if intent.intent == INTENT_MODIFY:
-            updated_draft = apply_simple_order_draft_modification(existing_draft, message)
+            if order_modify_needs_llm(message):
+                # 多项加/改：脆规则会丢项或改错，交给 LLM 解析 + 代码按名合并。
+                try:
+                    updated_draft = llm_update_order_draft(existing_draft, message)
+                except Exception as exc:
+                    logger.warning("order_llm_modify_failed user_id=%s error=%s", user_id, exc)
+                    updated_draft = None
+                if not updated_draft:
+                    return ChatResponse(
+                        user_id=user_id,
+                        answer="这条修改我没解析成功，麻烦拆开一句一句发，或按“商品 + 数量”重发。",
+                        history_length=history_length,
+                    )
+            else:
+                updated_draft = apply_simple_order_draft_modification(existing_draft, message)
             if updated_draft:
                 save_order_draft(user_id, updated_draft)
                 missing = order_draft_missing_fields(updated_draft)
