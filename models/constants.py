@@ -15,5 +15,4 @@ RECEIPT_STATUS_ALL = "all"
 
 STATE_CHANNEL_MEMORY = "memory"
 STATE_CHANNEL_SESSION = "session_state"
-STATE_CHANNEL_INTERVIEW_ARCHIVE = "interview_archive"
 CURSOR_CHANNEL_WECOM_KF = "wecom_kf"

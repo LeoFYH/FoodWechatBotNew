@@ -124,29 +124,6 @@ def migrate_session_state(path: Path, dry_run: bool) -> int:
     return len(state)
 
 
-def migrate_interviews(path: Path, dry_run: bool) -> int:
-    data = read_json_file(path)
-    if isinstance(data, list):
-        archive = {
-            str(record.get("session_id")): record
-            for record in data
-            if isinstance(record, dict) and record.get("session_id")
-        }
-    elif isinstance(data, dict):
-        archive = {
-            str(key): value
-            for key, value in data.items()
-            if isinstance(value, dict)
-        }
-    else:
-        print(f"interviews: skip missing or invalid {path}")
-        return 0
-    if not dry_run:
-        models.save_interview_archive(archive)
-    print(f"interviews: migrated {len(archive)} records from {path}")
-    return len(archive)
-
-
 def migrate_kf_cursors(path: Path, dry_run: bool) -> int:
     data = read_json_file(path)
     if not isinstance(data, dict):
@@ -165,7 +142,6 @@ def main() -> int:
     parser.add_argument("--receipts-db", default=os.getenv("RECEIPT_DB_FILE", "receipts.db"))
     parser.add_argument("--memory-file", default=os.getenv("MEMORY_FILE", "memory.json"))
     parser.add_argument("--session-state-file", default=os.getenv("SESSION_STATE_FILE", "session_state.json"))
-    parser.add_argument("--interview-archive-file", default=os.getenv("INTERVIEW_ARCHIVE_FILE", "interviews.json"))
     parser.add_argument("--kf-cursor-file", default=os.getenv("WECOM_KF_CURSOR_FILE", "kf_cursors.json"))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -179,7 +155,6 @@ def main() -> int:
     migrate_receipts(Path(args.receipts_db), args.dry_run)
     migrate_memory(Path(args.memory_file), args.dry_run)
     migrate_session_state(Path(args.session_state_file), args.dry_run)
-    migrate_interviews(Path(args.interview_archive_file), args.dry_run)
     migrate_kf_cursors(Path(args.kf_cursor_file), args.dry_run)
     return 0
 

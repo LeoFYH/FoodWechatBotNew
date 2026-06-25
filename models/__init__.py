@@ -95,18 +95,6 @@ def save_session_state(state: dict[str, dict[str, Any]]) -> None:
     redis_cache.set_json(_state_key("session_state"), state)
 
 
-def load_interview_archive() -> dict[str, dict[str, Any]]:
-    _require_redis()
-    return redis_cache.load_or_set(_state_key("interview_archive"), pg_conversations.load_interview_archive)
-
-
-def save_interview_archive(archive: dict[str, dict[str, Any]]) -> None:
-    _require_redis()
-    redis_cache.record_operation("interview_archive.save", {"archive": archive})
-    pg_conversations.save_interview_archive(archive)
-    redis_cache.set_json(_state_key("interview_archive"), archive)
-
-
 def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
     _require_redis()
     started_at = time.perf_counter()
@@ -241,7 +229,6 @@ __all__ = [
     "insert_receipt_payload",
     "is_enabled",
     "is_redis_cache_enabled",
-    "load_interview_archive",
     "load_kf_cursors",
     "load_memory",
     "load_session_state",
@@ -250,7 +237,6 @@ __all__ = [
     "query_order_payloads",
     "query_receipt_payloads",
     "redis_url",
-    "save_interview_archive",
     "save_kf_cursors",
     "save_memory",
     "save_session_state",

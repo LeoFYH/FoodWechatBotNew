@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from .constants import (
-    STATE_CHANNEL_INTERVIEW_ARCHIVE,
     STATE_CHANNEL_MEMORY,
     STATE_CHANNEL_SESSION,
 )
@@ -84,17 +83,4 @@ def load_session_state() -> dict[str, dict[str, Any]]:
 
 def save_session_state(state: dict[str, dict[str, Any]]) -> None:
     _save_state_map(STATE_CHANNEL_SESSION, state)
-
-
-def load_interview_archive() -> dict[str, dict[str, Any]]:
-    raw_archive = _load_state_map(STATE_CHANNEL_INTERVIEW_ARCHIVE)
-    return {
-        str(session_id): record
-        for session_id, record in raw_archive.items()
-        if isinstance(record, dict)
-    }
-
-
-def save_interview_archive(archive: dict[str, dict[str, Any]]) -> None:
-    _save_state_map(STATE_CHANNEL_INTERVIEW_ARCHIVE, archive)
 
