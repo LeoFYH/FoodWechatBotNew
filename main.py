@@ -1767,27 +1767,6 @@ def safe_extract_json_object(text: str) -> dict[str, Any]:
             return {}
 
 
-def build_global_business_route_messages(message: str) -> list[dict[str, str]]:
-    return [
-        {
-            "role": "system",
-            "content": (
-                "你只判断微信客服消息应该走哪条业务路由，不执行任何业务动作。"
-                "只能输出 JSON，格式 {\"route\":\"...\",\"confidence\":0.0,\"reason\":\"...\"}。"
-                "route 只能是 chat、order_text、enter_order、enter_receipt、order_query、unclear。"
-                "order_text=用户直接给了门店/商品/数量等订单内容；"
-                "enter_order=用户明确要进入录单/下单模式但未给订单明细；"
-                "enter_receipt=用户明确要记录产成品/车间入库；"
-                "order_query=用户查询订单库/同步/拉取结果；"
-                "chat=普通客服闲聊或业务咨询；unclear=不确定。"
-                "确认、取消、退出、撤回不能由你决定，遇到这类只输出 chat 或 unclear。"
-                "不要输出解释文本，不要输出 Markdown。"
-            ),
-        },
-        {"role": "user", "content": message},
-    ]
-
-
 def call_global_business_route_llm(messages: list[dict[str, str]]) -> str:
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -1795,36 +1774,6 @@ def call_global_business_route_llm(messages: list[dict[str, str]]) -> str:
         temperature=0,
     )
     return (response.choices[0].message.content or "").strip()
-
-
-def parse_global_business_route(raw_text: str) -> BusinessIntent:
-    data = safe_extract_json_object(raw_text)
-    route = str(data.get("route") or data.get("intent") or "").strip().lower()
-    if route not in {
-        GLOBAL_ROUTE_CHAT,
-        GLOBAL_ROUTE_ORDER_TEXT,
-        GLOBAL_ROUTE_ENTER_ORDER,
-        GLOBAL_ROUTE_ENTER_RECEIPT,
-        GLOBAL_ROUTE_ORDER_QUERY,
-        GLOBAL_ROUTE_UNCLEAR,
-    }:
-        return BusinessIntent(GLOBAL_ROUTE_UNCLEAR, 0.0, "llm", "invalid route")
-    try:
-        confidence = float(data.get("confidence", 0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
-    return BusinessIntent(route, confidence, "llm", str(data.get("reason") or "")[:160])
-
-
-def should_call_global_business_route_llm(message: str) -> bool:
-    command = normalize_command(message)
-    if is_question_like_command(command) and not command_contains_any(command, {"订单", "入库", "产成品", "成品"}):
-        return False
-    return command_contains_any(
-        command,
-        {"订单", "下单", "录单", "加单", "门店", "商品", "订", "入库", "产成品", "成品", "车间", "照片", "图片"},
-    ) or bool(re.search(r"\d+(?:\.\d+)?\s*(箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)", message))
 
 
 def classify_global_business_route(message: str) -> BusinessIntent:
