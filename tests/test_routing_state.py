@@ -132,16 +132,33 @@ class RoutingStateTests(unittest.TestCase):
         self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
         self.assertFalse(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
 
-    def test_receipt_modify_updates_single_item_quantity(self) -> None:
+    def test_receipt_modify_routes_to_skill_and_saves(self) -> None:
         self.main.save_receipt_draft(
             "u1",
-            {"date": "2026-06-24", "items": [{"name": "鲜肉馄饨", "qty": 10, "unit": "箱"}]},
+            {
+                "date": "2026-06-24",
+                "items": [
+                    {"name": "鲜肉馄饨", "qty": 10, "unit": "箱"},
+                    {"name": "虾肉馄饨", "qty": 6, "unit": "箱"},
+                ],
+            },
         )
-        response = self.main.handle_user_message("u1", "数量改成20件")
+        updated = self.main.normalize_receipt_payload(
+            {
+                "date": "2026-06-24",
+                "items": [
+                    {"name": "鲜肉馄饨", "qty": 20, "unit": "件"},
+                    {"name": "虾肉馄饨", "qty": 6, "unit": "箱"},
+                ],
+            }
+        )
+        with patch.object(self.main, "llm_receipt_draft_from_message", return_value=updated) as skill:
+            response = self.main.handle_user_message("u1", "鲜肉馄饨改成20件")
+        skill.assert_called_once()
         draft = self.main.get_receipt_draft("u1")
         self.assertIn("已按你的修改更新入库草稿", response.answer)
         self.assertEqual(draft["items"][0]["qty"], 20)
-        self.assertEqual(draft["items"][0]["unit"], "件")
+        self.assertEqual([item["name"] for item in draft["items"]], ["鲜肉馄饨", "虾肉馄饨"])
 
     def test_order_modify_routes_to_skill_and_saves(self) -> None:
         self.main.save_order_draft(
@@ -277,40 +294,16 @@ class RoutingStateTests(unittest.TestCase):
         self.assertNotIn("我不确定你是不是要保存", response.answer)
         self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
 
-    def test_receipt_modify_named_item_quantity_with_multiple_items(self) -> None:
+    def test_receipt_modify_skill_failure_keeps_draft(self) -> None:
         self.main.save_receipt_draft(
             "u1",
-            {
-                "date": "2026-06-24",
-                "items": [
-                    {"name": "鲜肉馄饨", "qty": 10, "unit": "箱"},
-                    {"name": "虾肉馄饨", "qty": 6, "unit": "箱"},
-                ],
-            },
+            {"date": "2026-06-24", "items": [{"name": "鲜肉馄饨", "qty": 10, "unit": "箱"}]},
         )
-        response = self.main.handle_user_message("u1", "鲜肉馄饨数量改成20件")
+        with patch.object(self.main, "llm_receipt_draft_from_message", return_value=None):
+            response = self.main.handle_user_message("u1", "鲜肉馄饨改成20件")
         draft = self.main.get_receipt_draft("u1")
-        self.assertIn("已按你的修改更新入库草稿", response.answer)
-        self.assertEqual(draft["items"][0]["qty"], 20)
-        self.assertEqual(draft["items"][0]["unit"], "件")
-        self.assertEqual(draft["items"][1]["qty"], 6)
-
-    def test_receipt_cancel_single_item_keeps_remaining_draft(self) -> None:
-        self.main.save_receipt_draft(
-            "u1",
-            {
-                "date": "2026-06-24",
-                "items": [
-                    {"name": "鲜肉馄饨", "qty": 10, "unit": "箱"},
-                    {"name": "虾肉馄饨", "qty": 6, "unit": "箱"},
-                ],
-            },
-        )
-        response = self.main.handle_user_message("u1", "取消鲜肉馄饨")
-        draft = self.main.get_receipt_draft("u1")
-        self.assertIn("已按你的修改更新入库草稿", response.answer)
-        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_RECEIPT)
-        self.assertEqual([item["name"] for item in draft["items"]], ["虾肉馄饨"])
+        self.assertIn("没解析成功", response.answer)
+        self.assertEqual([item["name"] for item in draft["items"]], ["鲜肉馄饨"])
 
     def test_confirm_question_is_not_confirm_command(self) -> None:
         self.assertFalse(self.main.is_confirm_command("发票可以开吗", has_draft=True))

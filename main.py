@@ -4216,6 +4216,66 @@ def format_receipt_draft_summary(draft: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+RECEIPT_SKILL_FILE = Path(
+    os.getenv("RECEIPT_SKILL_FILE", str(Path(__file__).resolve().parent / "skills" / "receipt" / "SKILL.md"))
+)
+
+
+def load_receipt_skill() -> str:
+    """读取入库 skill（规则 + 例子）。每次读取，改了 .md 立即生效。"""
+    try:
+        return RECEIPT_SKILL_FILE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning("receipt_skill_load_failed file=%s error=%s", RECEIPT_SKILL_FILE, exc)
+        return ""
+
+
+def llm_receipt_draft_from_message(existing_draft: dict[str, Any], message: str) -> dict[str, Any] | None:
+    """入库整理大脑：读 skill + 当前草稿 + 用户消息 → 输出【完整】更新后入库草稿。
+
+    加 / 改 / 删 / 换统一走这里；代码只做归一化与身份字段保护。失败返回 None，调用方兜底。
+    """
+    skill = load_receipt_skill()
+    today = datetime.now().date().isoformat()
+    current = json.dumps(existing_draft or {}, ensure_ascii=False)
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": skill},
+                {
+                    "role": "user",
+                    "content": (
+                        f"今天日期：{today}\n\n"
+                        f"当前入库草稿（JSON）：\n{current}\n\n"
+                        f"用户最新消息：\n{message}\n\n"
+                        "请输出更新后的【完整】入库草稿 JSON：应用用户的加 / 改 / 删 / 换，"
+                        "保留所有未改动的成品，只输出一个 JSON 对象。"
+                    ),
+                },
+            ],
+            temperature=0,
+        )
+    except Exception as exc:
+        logger.warning("receipt_skill_llm_failed error=%s", exc)
+        return None
+
+    parsed = extract_json_object(response.choices[0].message.content or "")
+    if not parsed:
+        return None
+
+    # 身份 / 系统字段以现有草稿为准，不让文字更新悄悄改掉。
+    if existing_draft:
+        for key in ("status", "created_at", "id", "raw_ref"):
+            if existing_draft.get(key):
+                parsed[key] = existing_draft.get(key)
+
+    normalized = normalize_receipt_payload(parsed)
+    if not normalized or not normalized.get("items"):
+        return None
+    return normalized
+
+
 def apply_simple_receipt_draft_modification(draft: dict[str, Any], message: str) -> dict[str, Any] | None:
     if not receipt_draft_has_content(draft):
         return None
@@ -4340,17 +4400,18 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
                 history_length=0,
             )
         if intent.intent == INTENT_MODIFY:
-            updated_draft = apply_simple_receipt_draft_modification(draft, message)
-            if updated_draft:
-                save_receipt_draft(user_id, updated_draft)
-                missing = receipt_missing_fields(updated_draft)
-                answer = receipt_draft_reply("已按你的修改更新入库草稿：", updated_draft, missing)
-                return ChatResponse(user_id=user_id, answer=answer, history_length=0)
-            return ChatResponse(
-                user_id=user_id,
-                answer="入库草稿这条修改我没合并稳。请重新发送照片，或发“取消”清空后重来。",
-                history_length=0,
-            )
+            # 加 / 改 / 删 / 换统一交给入库 skill 大脑，输出完整更新后草稿（旧成品不丢）。
+            updated_draft = llm_receipt_draft_from_message(draft, message)
+            if not updated_draft:
+                return ChatResponse(
+                    user_id=user_id,
+                    answer="这条修改我没解析成功，麻烦把要加 / 改 / 删的成品和数量说清楚再发一次。",
+                    history_length=0,
+                )
+            save_receipt_draft(user_id, updated_draft)
+            missing = receipt_missing_fields(updated_draft)
+            answer = receipt_draft_reply("已按你的修改更新入库草稿：", updated_draft, missing)
+            return ChatResponse(user_id=user_id, answer=answer, history_length=0)
         if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT}:
             return ChatResponse(
                 user_id=user_id,
