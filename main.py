@@ -2686,6 +2686,75 @@ def save_confirmed_order_response(user_id: str, draft: dict[str, Any], history_l
     )
 
 
+ORDER_SKILL_FILE = Path(
+    os.getenv("ORDER_SKILL_FILE", str(Path(__file__).resolve().parent / "skills" / "order" / "SKILL.md"))
+)
+
+
+def load_order_skill() -> str:
+    """读取订单 skill（规则 + 例子）。每次读取，方便你改了 .md 立即生效，不用重启想。"""
+    try:
+        return ORDER_SKILL_FILE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning("order_skill_load_failed file=%s error=%s", ORDER_SKILL_FILE, exc)
+        return ""
+
+
+def llm_order_draft_from_message(existing_draft: dict[str, Any], message: str) -> dict[str, Any] | None:
+    """订单整理大脑：读 skill + 当前草稿 + 用户消息 → 输出【完整】更新后草稿。
+
+    新单或加 / 改 / 删 / 换都统一走这里：LLM 负责理解并产出完整草稿，
+    代码只做归一化与身份字段保护。失败返回 None，由调用方安全兜底。
+    """
+    skill = load_order_skill()
+    today = datetime.now().date().isoformat()
+    current = json.dumps(existing_draft or {}, ensure_ascii=False)
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": skill},
+                {
+                    "role": "user",
+                    "content": (
+                        f"今天日期：{today}\n\n"
+                        f"当前订单草稿（JSON，空对象 {{}} 表示还没有草稿）：\n{current}\n\n"
+                        f"用户最新消息：\n{message}\n\n"
+                        "请输出更新后的【完整】订单草稿 JSON：应用用户的加 / 改 / 删 / 换，"
+                        "保留所有未改动的商品，只输出一个 JSON 对象。"
+                    ),
+                },
+            ],
+            temperature=0,
+        )
+    except Exception as exc:
+        logger.warning("order_skill_llm_failed error=%s", exc)
+        return None
+
+    parsed = extract_json_object(response.choices[0].message.content or "")
+    if not parsed:
+        return None
+
+    # 身份 / 系统字段以现有草稿为准，不让文字更新悄悄改掉。
+    if existing_draft:
+        for key in ("kind", "source", "order_no", "orderer", "raw_ref", "created_at"):
+            if existing_draft.get(key):
+                parsed[key] = existing_draft.get(key)
+
+    explicit_order_date = extract_explicit_order_date(message)
+    if explicit_order_date:
+        parsed["order_date"] = explicit_order_date
+
+    parsed["confirmed"] = False
+    parsed["status"] = ORDER_STATUS_NEW
+    parsed["created_at"] = parsed.get("created_at") or now_iso()
+
+    normalized = normalize_order_draft(parsed)
+    if not normalized or not normalized.get("items"):
+        return None
+    return normalized
+
+
 def llm_parse_order_draft(existing_draft: dict[str, Any], message: str) -> dict[str, Any]:
     existing_kind = existing_draft.get("kind") if isinstance(existing_draft, dict) else ""
     if existing_kind == ORDER_KIND_BASE:
@@ -4150,13 +4219,6 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 history_length=history_length,
             )
 
-        if is_overly_complex_order_instruction(message):
-            return ChatResponse(
-                user_id=user_id,
-                answer=complex_order_instruction_reply(has_draft=True),
-                history_length=history_length,
-            )
-
         intent = classify_order_reply_intent(message, existing_draft)
         if intent.intent == INTENT_CANCEL and intent.is_rule:
             clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
@@ -4180,30 +4242,25 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 history_length=history_length,
             )
         if intent.intent == INTENT_MODIFY:
-            if order_modify_needs_llm(message):
-                # 多项加/改：脆规则会丢项或改错，交给 LLM 解析 + 代码按名合并。
-                try:
-                    updated_draft = llm_update_order_draft(existing_draft, message)
-                except Exception as exc:
-                    logger.warning("order_llm_modify_failed user_id=%s error=%s", user_id, exc)
-                    updated_draft = None
-                if not updated_draft:
-                    return ChatResponse(
-                        user_id=user_id,
-                        answer="这条修改我没解析成功，麻烦拆开一句一句发，或按“商品 + 数量”重发。",
-                        history_length=history_length,
-                    )
-            else:
-                updated_draft = apply_simple_order_draft_modification(existing_draft, message)
-            if updated_draft:
-                save_order_draft(user_id, updated_draft)
-                missing = order_draft_missing_fields(updated_draft)
-                answer = order_draft_reply("已按你的修改更新订单草稿：", updated_draft, missing)
+            # 加 / 改 / 删 / 换统一交给订单 skill 大脑，输出完整更新后草稿（旧项不丢）。
+            updated_draft = llm_order_draft_from_message(existing_draft, message)
+            if not updated_draft:
                 return ChatResponse(
                     user_id=user_id,
-                    answer=answer,
+                    answer="这条修改我没解析成功，麻烦把要加 / 改 / 删的商品和数量说清楚再发一次。",
                     history_length=history_length,
                 )
+            updated_draft["raw_ref"] = updated_draft.get("raw_ref") or raw_ref or user_id
+            if updated_draft.get("kind") == ORDER_KIND_PATCH:
+                updated_draft["raw_text"] = message
+            save_order_draft(user_id, updated_draft)
+            missing = order_draft_missing_fields(updated_draft)
+            answer = order_draft_reply("已按你的修改更新订单草稿：", updated_draft, missing)
+            return ChatResponse(
+                user_id=user_id,
+                answer=answer,
+                history_length=history_length,
+            )
         if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT} and not looks_like_order_message(message):
             return ChatResponse(
                 user_id=user_id,
@@ -4218,30 +4275,17 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
             history_length=history_length,
         )
 
-    if is_overly_complex_order_instruction(message):
+    draft = llm_order_draft_from_message(existing_draft, message)
+    if not draft:
         return ChatResponse(
             user_id=user_id,
-            answer=complex_order_instruction_reply(has_draft=False),
-            history_length=history_length,
-        )
-
-    try:
-        draft = llm_parse_order_draft(existing_draft, message)
-    except Exception as exc:
-        logger.warning("order_parse_failed user_id=%s error=%s", user_id, exc)
-        return ChatResponse(
-            user_id=user_id,
-            answer="这条订单我没有解析成功。请按“门店 + 商品 + 数量”的格式重发，例如：老三家 鸡腿 20件。",
+            answer="这条订单我没有解析成功。请把门店、商品、数量说清楚再发一次，例如：老三家 鸡腿 20件。",
             history_length=history_length,
         )
 
     draft["raw_ref"] = draft.get("raw_ref") or raw_ref or user_id
     if draft.get("kind") == ORDER_KIND_PATCH:
         draft["raw_text"] = draft.get("raw_text") or message
-    draft["confirmed"] = False
-    draft["status"] = ORDER_STATUS_NEW
-    draft["created_at"] = draft.get("created_at") or now_iso()
-    draft = normalize_order_draft(draft)
     save_order_draft(user_id, draft)
 
     missing = order_draft_missing_fields(draft)
@@ -4642,14 +4686,6 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         return ChatResponse(
             user_id=user_id,
             answer=build_order_storage_query_reply(user_id),
-            history_length=user_order_count(user_id),
-        )
-
-    complex_order_message = inline_order_message if inline_order_message is not None else message
-    if not has_any_draft and is_overly_complex_order_instruction(complex_order_message):
-        return ChatResponse(
-            user_id=user_id,
-            answer=complex_order_instruction_reply(has_draft=False),
             history_length=user_order_count(user_id),
         )
 
