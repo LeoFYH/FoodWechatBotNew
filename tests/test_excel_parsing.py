@@ -41,7 +41,8 @@ class FakeWorkbook:
 
 class ExcelParsingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory()
+        # Windows 上 SQLite 连接未关时临时文件会被占用，导致清理报错；忽略清理异常即可（仅影响测试临时目录回收）。
+        self.tempdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         root = Path(self.tempdir.name)
         self.env_patch = patch.dict(
             os.environ,

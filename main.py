@@ -45,6 +45,7 @@ from services.business_intent import (
     BusinessIntent,
     classify_business_intent,
 )
+import agent_router
 import models
 
 load_dotenv()
@@ -1840,19 +1841,15 @@ def classify_global_business_route(message: str) -> BusinessIntent:
         return BusinessIntent(GLOBAL_ROUTE_ENTER_ORDER, 0.92, "rule", "order mode command")
     if is_receipt_mode_command(command):
         return BusinessIntent(GLOBAL_ROUTE_ENTER_RECEIPT, 0.92, "rule", "receipt mode command")
-    if not should_call_global_business_route_llm(message):
-        return BusinessIntent(GLOBAL_ROUTE_CHAT, 0.7, "rule", "no business route signal")
-
-    try:
-        route = parse_global_business_route(call_global_business_route_llm(build_global_business_route_messages(message)))
-    except Exception:
-        return BusinessIntent(GLOBAL_ROUTE_UNCLEAR, 0.0, "llm_error", "route classifier failed")
-
-    if route.intent in {GLOBAL_ROUTE_ORDER_TEXT, GLOBAL_ROUTE_ENTER_ORDER, GLOBAL_ROUTE_ENTER_RECEIPT, GLOBAL_ROUTE_ORDER_QUERY} and route.confidence >= 0.78:
-        return route
-    if route.intent == GLOBAL_ROUTE_CHAT and route.confidence >= 0.85:
-        return route
-    return BusinessIntent(GLOBAL_ROUTE_UNCLEAR, route.confidence, route.source, route.reason)
+    # 规则拿不准 → 交给 agent_router 大脑做大模型分诊。
+    # 注意：这里【不再有关键词闸门 should_call_global_business_route_llm】，
+    # 所以自然语言 / 复杂订单消息也会进大模型分诊，而不是被默认当成聊天丢掉——
+    # 这正是修复"复杂消息看不懂"的关键改动。置信度阈值已内置在 agent_router 中（0.78 / 0.85）。
+    decision = agent_router.decide_from_llm(
+        message,
+        llm_classifier=call_global_business_route_llm,
+    )
+    return BusinessIntent(decision.intent, decision.confidence, decision.source, decision.reason)
 
 
 def append_mode_hint(answer: str, mode: str) -> str:
@@ -4637,6 +4634,15 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
 
     if current_mode == SESSION_MODE_ORDER:
         if looks_like_order_message(message):
+            return handle_order_user_message(user_id, message, raw_ref=raw_ref)
+        # 关键词没认出来时再问一次大脑：在订单模式下，这很可能是表达复杂的订单内容，
+        # 不该直接当成闲聊丢掉。大脑判为 order_text 才进订单流程，否则才走普通聊天。
+        order_mode_route = agent_router.decide_from_llm(
+            message,
+            mode=SESSION_MODE_ORDER,
+            llm_classifier=call_global_business_route_llm,
+        )
+        if order_mode_route.intent == agent_router.ROUTE_ORDER_TEXT:
             return handle_order_user_message(user_id, message, raw_ref=raw_ref)
         return handle_general_chat(user_id, message, mode_hint=SESSION_MODE_ORDER)
 
