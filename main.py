@@ -1711,31 +1711,6 @@ def count_keyword_occurrences(text: str, keywords: set[str]) -> int:
     return sum(text.count(keyword) for keyword in keywords if keyword)
 
 
-def is_overly_complex_order_instruction(message: str) -> bool:
-    command = normalize_command(message)
-    if len(command) < 22:
-        return False
-    action_count = count_keyword_occurrences(command, ORDER_COMPLEX_ACTION_KEYWORDS)
-    if action_count < 2:
-        return False
-    connector_count = count_keyword_occurrences(command, ORDER_COMPLEX_CONNECTORS)
-    quantity_count = len(re.findall(r"\d+(?:\.\d+)?\s*(?:箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)", message))
-    if action_count >= 4:
-        return True
-    if connector_count >= 2:
-        return True
-    return quantity_count >= 2 and action_count >= 3
-
-
-def complex_order_instruction_reply(*, has_draft: bool) -> str:
-    target = "更新订单草稿" if has_draft else "进入订单草稿"
-    return (
-        f"这句话包含的动作太多，我先不{target}，避免记错。"
-        "请拆开说清楚，比如先发“把鸡蛋面换成小麦面”，我复述草稿后，"
-        "再发“加猪肉烧卖、牛肉烧卖各10斤”。"
-    )
-
-
 def looks_like_receipt_business_message(message: str) -> bool:
     command = normalize_command(message)
     if is_business_query_or_negated(command) or is_question_like_command(command):
@@ -2570,87 +2545,6 @@ def replace_order_text_fields(updated: dict[str, Any], message: str) -> bool:
                 changed = replace_text_field(item, key, old_value, new_value) or changed
 
     return changed
-
-
-def apply_simple_order_draft_modification(draft: dict[str, Any], message: str) -> dict[str, Any] | None:
-    updated = json.loads(json.dumps(draft, ensure_ascii=False))
-    changed = False
-    changed = replace_cancelled_order_items(updated, message) or changed
-    changed = remove_items_from_message(updated, message) or changed
-    changed = update_named_item_quantity(updated, message) or changed
-    changed = add_items_from_message(updated, message) or changed
-    changed = replace_order_text_fields(updated, message) or changed
-
-    if not changed:
-        return None
-
-    updated["confirmed"] = False
-    updated["status"] = ORDER_STATUS_NEW
-    return normalize_order_draft(updated)
-
-
-def order_modify_needs_llm(message: str) -> bool:
-    """判断是否“多项加/改”——这类脆规则会丢项或改错，应交给 LLM 整体解析。
-
-    触发条件（命中其一）：
-    - 出现 ≥2 个“改成/改为”：多项改量；
-    - 没有“各”(共享数量) 却出现 ≥2 个“数量+单位”：多项各自数量的加/改。
-    单项改动（单个数量、或“各X”共享数量）不触发，继续走便宜的规则路径。
-    """
-    text = str(message or "")
-    if len(re.findall(r"改成|改为", text)) >= 2:
-        return True
-    if "各" not in text:
-        qty_tokens = re.findall(r"\d+(?:\.\d+)?\s*(?:箱|件|袋|盒|包|斤|公斤|kg|KG|份|个|瓶|桶|条|只)", text)
-        if len(qty_tokens) >= 2:
-            return True
-    return False
-
-
-def merge_order_items(
-    existing_items: list[dict[str, Any]], patch_items: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """把 LLM 解析出的改动项按“商品名”稳妥合并进现有明细：同名改量、新名追加。
-
-    合并由代码完成（不靠 LLM 复述未改动的旧项），避免旧商品被漏掉。
-    """
-    merged = [dict(item) for item in (existing_items or [])]
-    index = {str(item.get("name") or "").strip(): item for item in merged if item.get("name")}
-    for patch in patch_items or []:
-        name = str(patch.get("name") or "").strip()
-        if not name:
-            continue
-        target = index.get(name)
-        if target is not None:
-            if patch.get("qty") is not None:
-                target["qty"] = patch.get("qty")
-            if patch.get("unit"):
-                target["unit"] = patch.get("unit")
-        else:
-            new_item = dict(patch)
-            merged.append(new_item)
-            index[name] = new_item
-    return merged
-
-
-def llm_update_order_draft(existing_draft: dict[str, Any], message: str) -> dict[str, Any] | None:
-    """多项加/改：用 LLM 解析改动，再按商品名合并进现有草稿。
-
-    LLM 只负责把自然语言变成结构化改动项；合并旧明细由 merge_order_items（代码）完成，
-    所以即便表达复杂，旧商品也不会丢。失败由调用方兜底。
-    """
-    patch = llm_parse_order_draft(existing_draft, message)
-    patch_items = patch.get("items") if isinstance(patch, dict) else None
-    if not patch_items:
-        return None
-    merged = json.loads(json.dumps(existing_draft, ensure_ascii=False))
-    merged["items"] = merge_order_items(existing_draft.get("items") or [], patch_items)
-    for key in ("store", "order_date", "deliver_date"):
-        if not merged.get(key) and patch.get(key):
-            merged[key] = patch.get(key)
-    merged["confirmed"] = False
-    merged["status"] = ORDER_STATUS_NEW
-    return normalize_order_draft(merged)
 
 
 def save_confirmed_order_response(user_id: str, draft: dict[str, Any], history_length: int) -> ChatResponse:
