@@ -59,8 +59,6 @@ DEFAULT_WECOM_BOT_NAME = "食品厂机器人"
 DEFAULT_WECOM_KF_SYNC_LIMIT = 100
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
 DEFAULT_EXPORT_DIR = "exports"
-DEFAULT_INTERVIEW_IDLE_ARCHIVE_SECONDS = 300
-DEFAULT_INTERVIEW_ARCHIVE_POLL_SECONDS = 60
 DEFAULT_SESSION_STATE_FILE = "session_state.json"
 DEFAULT_ORDER_DB_FILE = "orders.db"
 DEFAULT_RECEIPT_DB_FILE = "receipts.db"
@@ -155,22 +153,12 @@ WECOM_KF_SYNC_LIMIT = get_int_env("WECOM_KF_SYNC_LIMIT", DEFAULT_WECOM_KF_SYNC_L
 HTTP_TIMEOUT_SECONDS = get_int_env("HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS)
 EXPORT_DIR = Path(os.getenv("EXPORT_DIR", DEFAULT_EXPORT_DIR))
 EXPORT_TOKEN = os.getenv("EXPORT_TOKEN")
-INTERVIEW_ARCHIVE_FILE = Path(os.getenv("INTERVIEW_ARCHIVE_FILE", "interviews.json"))
-INTERVIEW_IDLE_ARCHIVE_SECONDS = get_int_env(
-    "INTERVIEW_IDLE_ARCHIVE_SECONDS",
-    DEFAULT_INTERVIEW_IDLE_ARCHIVE_SECONDS,
-)
-INTERVIEW_ARCHIVE_POLL_SECONDS = get_int_env(
-    "INTERVIEW_ARCHIVE_POLL_SECONDS",
-    DEFAULT_INTERVIEW_ARCHIVE_POLL_SECONDS,
-)
 SEEN_WECOM_MSG_IDS: set[str] = set()
 SEEN_WECOM_MSG_IDS_LOCK = Lock()
 SEEN_WECOM_KF_MSG_IDS: set[str] = set()
 SEEN_WECOM_KF_MSG_IDS_LOCK = Lock()
 WECOM_KF_CURSOR_LOCK = Lock()
 WECOM_KF_ACCESS_TOKEN_LOCK = Lock()
-INTERVIEW_ARCHIVE_LOCK = Lock()
 SESSION_STATE_LOCK = Lock()
 ORDER_LOCK = Lock()
 ORDER_DB_LOCK = Lock()
@@ -1037,123 +1025,13 @@ def query_receipt_payloads_by_status(date: str, status: str | None = None) -> li
     return [row_to_receipt_payload(row) for row in rows]
 
 
-def load_interview_archive() -> dict[str, dict[str, Any]]:
-    if models.is_enabled():
-        return models.load_interview_archive()
-
-    if not INTERVIEW_ARCHIVE_FILE.exists():
-        return {}
-
-    raw_archive = INTERVIEW_ARCHIVE_FILE.read_text(encoding="utf-8").strip()
-    if not raw_archive:
-        return {}
-
-    try:
-        data = json.loads(raw_archive)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail="interviews.json is not valid JSON") from exc
-
-    if isinstance(data, list):
-        return {
-            str(record.get("session_id")): record
-            for record in data
-            if isinstance(record, dict) and record.get("session_id")
-        }
-    if isinstance(data, dict):
-        return {
-            str(session_id): record
-            for session_id, record in data.items()
-            if isinstance(record, dict)
-        }
-
-    raise HTTPException(status_code=500, detail="interviews.json must contain an object or array")
-
-
-def save_interview_archive(archive: dict[str, dict[str, Any]]) -> None:
-    if models.is_enabled():
-        models.save_interview_archive(archive)
-        return
-
-    INTERVIEW_ARCHIVE_FILE.write_text(
-        json.dumps(archive, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-EXPORT_HEADERS = [
-    "会话ID",
-    "更新时间",
-    "公司",
-    "姓名",
-    "职位",
-    "负责内容",
-    "流程",
-    "频率",
-    "最费时间",
-    "出错后果",
-    "现用工具/费用",
-    "改善尝试",
-    "数据/规则",
-    "不在范围",
-    "原始对话",
-]
-
-
-RECAP_FIELD_PATTERNS = {
-    "company": [r"公司[：:]\s*(.+)", r"企业[：:]\s*(.+)"],
-    "name": [r"姓名[：:]\s*(.+)", r"联系人[：:]\s*(.+)"],
-    "title": [r"职位[：:]\s*(.+)", r"岗位[：:]\s*(.+)"],
-    "responsibility": [r"负责内容[：:]\s*(.+)", r"负责[：:]\s*(.+)"],
-    "flow": [r"流程[：:]\s*(.+)"],
-    "frequency": [r"频率[：:]\s*(.+)"],
-    "time_cost": [r"最费时间[：:]\s*(.+)", r"最花时间[：:]\s*(.+)"],
-    "error_impact": [r"出错后果[：:]\s*(.+)", r"错误后果[：:]\s*(.+)"],
-    "current_tools": [r"现在用[：:]\s*(.+)", r"现用工具/费用[：:]\s*(.+)"],
-    "improvement": [r"改善尝试[：:]\s*(.+)", r"之前试过[：:]\s*(.+)"],
-    "data_rules": [r"规则在[：:]\s*(.+)", r"数据/规则[：:]\s*(.+)"],
-    "out_of_scope": [r"不在范围[：:]\s*(.+)"],
-}
-
-INTERVIEW_EXPORT_FIELDS = [
-    "company",
-    "name",
-    "title",
-    "responsibility",
-    "flow",
-    "frequency",
-    "time_cost",
-    "error_impact",
-    "current_tools",
-    "improvement",
-    "data_rules",
-    "out_of_scope",
-]
-
-INTERVIEW_FIELD_FALLBACKS = {
-    "company": "未确认公司",
-    "name": "未询问",
-    "title": "未确认职位",
-    "responsibility": "未明确说明，按对话暂归为其日常负责事项",
-    "flow": "未完整说明，按原始对话暂整理",
-    "frequency": "未提及，暂按按需/低频处理",
-    "time_cost": "未提及，暂按存在人工耗时处理",
-    "error_impact": "未提及明确错误，暂记为未出过错",
-    "current_tools": "未提及，暂记为现有人工/常用工具处理",
-    "improvement": "未提及，暂记为未尝试",
-    "data_rules": "未提及，暂按经验/内部文件处理",
-    "out_of_scope": "未提及，暂记为无特殊情况",
-}
-
-ARCHIVE_EVENT_TYPES = {"close_session", "session_close", "archive_session"}
-
-SESSION_MODE_INTERVIEW = "interview"
+SESSION_MODE_CHAT = "chat"
 SESSION_MODE_ORDER = "order"
 SESSION_MODE_RECEIPT = "receipt"
-SESSION_MODES = {SESSION_MODE_INTERVIEW, SESSION_MODE_ORDER, SESSION_MODE_RECEIPT}
+SESSION_MODES = {SESSION_MODE_CHAT, SESSION_MODE_ORDER, SESSION_MODE_RECEIPT}
 
 ORDER_MODE_COMMANDS = {"订单", "录单", "下单", "订单模式", "开始订单", "开始录单"}
 RECEIPT_MODE_COMMANDS = {"入库", "入库模式", "产成品入库", "开始入库", "成品入库"}
-INTERVIEW_MODE_COMMANDS = {"问诊", "访谈", "需求访谈", "问诊模式", "访谈模式", "普通模式", "聊天"}
 EXIT_MODE_COMMANDS = {"退出", "结束", "不弄了", "算了", "返回", "退出订单", "退出入库", "结束订单", "结束入库"}
 STATUS_COMMANDS = {"状态", "我在哪", "我在哪儿", "当前状态", "现在状态", "现在是什么模式"}
 MODE_HELP_COMMANDS = {"模式", "有哪些模式", "有什么模式", "你有哪些模式", "你有什么模式", "怎么用", "你会什么", "功能", "帮助"}
@@ -1567,7 +1445,7 @@ def switch_session_mode(user_id: str, mode: str, *, clear_drafts: bool = False) 
 
     record = get_session_record(user_id)
     record["mode"] = mode
-    if clear_drafts or mode == SESSION_MODE_INTERVIEW:
+    if clear_drafts or mode == SESSION_MODE_CHAT:
         record.pop("order_draft", None)
         record.pop("receipt_draft", None)
     elif mode == SESSION_MODE_ORDER:
@@ -1596,14 +1474,14 @@ def clear_current_business_draft(user_id: str, mode: str | None = None) -> None:
     else:
         record.pop("order_draft", None)
         record.pop("receipt_draft", None)
-        record["mode"] = SESSION_MODE_INTERVIEW
+        record["mode"] = SESSION_MODE_CHAT
     save_session_record(user_id, record)
 
 
 def exit_business_mode(user_id: str) -> str:
     previous_mode = get_session_mode(user_id)
     record = get_session_record(user_id)
-    record["mode"] = SESSION_MODE_INTERVIEW
+    record["mode"] = SESSION_MODE_CHAT
     record.pop("order_draft", None)
     record.pop("receipt_draft", None)
     save_session_record(user_id, record)
@@ -1824,9 +1702,9 @@ def save_session_record(user_id: str, record: dict[str, Any]) -> None:
 
 
 def get_session_mode(user_id: str) -> str:
-    mode = str(get_session_record(user_id).get("mode") or SESSION_MODE_INTERVIEW)
+    mode = str(get_session_record(user_id).get("mode") or SESSION_MODE_CHAT)
     if mode not in SESSION_MODES:
-        return SESSION_MODE_INTERVIEW
+        return SESSION_MODE_CHAT
     return mode
 
 
@@ -1855,7 +1733,7 @@ def clear_order_draft(user_id: str, *, next_mode: str = SESSION_MODE_ORDER) -> N
     record = get_session_record(user_id)
     record["mode"] = next_mode
     record.pop("order_draft", None)
-    if next_mode == SESSION_MODE_INTERVIEW:
+    if next_mode == SESSION_MODE_CHAT:
         record.pop("receipt_draft", None)
     save_session_record(user_id, record)
 
@@ -1881,7 +1759,7 @@ def clear_receipt_draft(user_id: str, *, next_mode: str = SESSION_MODE_RECEIPT) 
     record = get_session_record(user_id)
     record["mode"] = next_mode
     record.pop("receipt_draft", None)
-    if next_mode == SESSION_MODE_INTERVIEW:
+    if next_mode == SESSION_MODE_CHAT:
         record.pop("order_draft", None)
     save_session_record(user_id, record)
 
@@ -3437,260 +3315,8 @@ def user_order_count(user_id: str) -> int:
     )
 
 
-def normalize_interview_record(record: dict[str, Any]) -> dict[str, str]:
-    normalized = {key: str(value or "").strip() for key, value in record.items()}
-
-    for field in INTERVIEW_EXPORT_FIELDS:
-        if not normalized.get(field):
-            normalized[field] = INTERVIEW_FIELD_FALLBACKS[field]
-
-    return normalized
-
-
-def llm_complete_interview_record(base_record: dict[str, str], transcript: str) -> dict[str, str]:
-    prompt = f"""
-请把下面的微信访谈对话整理成 Excel 表格字段，只输出一个 JSON 对象，不要输出解释。
-
-要求：
-- 字段必须包含：company, name, title, responsibility, flow, frequency, time_cost, error_impact, current_tools, improvement, data_rules, out_of_scope。
-- company 必须尽量使用用户原文里的公司名称；没明确说就填“未确认公司”。
-- title 必须尽量使用用户原文里的职位/岗位/工种；没明确说就按对话合理推断，仍不确定填“未确认职位”。
-- name 不再追问；如果对话没提到姓名或称呼，填“未询问”。
-- 其他字段不要留空；信息不全时，根据对话做保守推断，并用简短中文写清楚“暂推”。
-- 不要编造具体金额、具体系统名或具体时间；没有提到就写“未提及，暂推...”。
-
-现有初步抽取：
-{json.dumps({field: base_record.get(field, "") for field in INTERVIEW_EXPORT_FIELDS}, ensure_ascii=False)}
-
-原始对话：
-{transcript}
-""".strip()
-
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "你是访谈记录结构化助手，只输出可解析 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    raw = response.choices[0].message.content or ""
-    data = extract_json_object(raw)
-
-    completed = dict(base_record)
-    for field in INTERVIEW_EXPORT_FIELDS:
-        value = data.get(field)
-        if value:
-            completed[field] = clean_export_value(str(value))
-    return normalize_interview_record(completed)
-
-
-def interview_record_from_history(session_id: str, messages: list[dict[str, str]]) -> dict[str, str]:
-    recap = latest_recap_text(messages)
-    text_for_extract = recap or conversation_to_text(messages)
-
-    record = {
-        "session_id": session_id,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "company": "",
-        "name": "",
-        "title": "",
-        "responsibility": "",
-        "flow": "",
-        "frequency": "",
-        "time_cost": "",
-        "error_impact": "",
-        "current_tools": "",
-        "improvement": "",
-        "data_rules": "",
-        "out_of_scope": "",
-        "transcript": conversation_to_text(messages),
-    }
-
-    for field, patterns in RECAP_FIELD_PATTERNS.items():
-        record[field] = extract_first_match(text_for_extract, patterns)
-
-    if not record["company"]:
-        record["company"] = extract_field_from_conversation(
-            messages,
-            [
-                r"公司(?:是|叫)?[：:，, ]\s*([^，,。；;\n]+)",
-                r"(?:我是|我在)([^，,。；;\n]{2,40}(?:公司|集团|店|厂|餐饮|科技|有限|有限公司))",
-            ],
-        )
-
-    if not record["company"]:
-        record["company"] = "未确认公司"
-
-    return normalize_interview_record(record)
-
-
-def last_user_message_ts(messages: list[dict[str, Any]]) -> float | None:
-    for message in reversed(messages):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-
-        ts = message.get("ts")
-        if isinstance(ts, (int, float)):
-            return float(ts)
-        if isinstance(ts, str):
-            try:
-                return float(ts)
-            except ValueError:
-                pass
-
-        created_at = message.get("created_at")
-        if isinstance(created_at, str):
-            try:
-                return datetime.fromisoformat(created_at).timestamp()
-            except ValueError:
-                return None
-
-    return None
-
-
-def completed_interview_record_from_history(
-    session_id: str,
-    messages: list[dict[str, str]],
-    reason: str,
-) -> dict[str, str]:
-    record = interview_record_from_history(session_id, messages)
-    transcript = record["transcript"]
-
-    try:
-        record = llm_complete_interview_record(record, transcript)
-    except Exception as exc:
-        logger.warning(
-            "interview_archive_llm_failed session_id=%s reason=%s error=%s",
-            session_id,
-            reason,
-            exc,
-        )
-
-    record["session_id"] = session_id
-    record["updated_at"] = now_iso()
-    record["archived_at"] = now_iso()
-    record["archive_reason"] = reason
-    record["status"] = "archived"
-    record["transcript"] = transcript
-    record["_message_count"] = str(len(messages))
-    record["_last_user_ts"] = str(last_user_message_ts(messages) or "")
-    return normalize_interview_record(record)
-
-
-def archive_interview_session(session_id: str, reason: str) -> dict[str, str] | None:
-    with MEMORY_LOCK:
-        memory = load_memory()
-        messages = memory.get(session_id, [])
-
-    if not isinstance(messages, list):
-        logger.warning("interview_archive_invalid_history session_id=%s", session_id)
-        return None
-    if not any(isinstance(message, dict) and message.get("role") == "user" for message in messages):
-        logger.info("interview_archive_skipped_no_user_messages session_id=%s reason=%s", session_id, reason)
-        return None
-
-    message_count = len(messages)
-    last_user_ts = str(last_user_message_ts(messages) or "")
-    with INTERVIEW_ARCHIVE_LOCK:
-        archive = load_interview_archive()
-        existing = archive.get(session_id)
-        if (
-            existing
-            and str(existing.get("_message_count", "")) == str(message_count)
-            and str(existing.get("_last_user_ts", "")) == last_user_ts
-        ):
-            return normalize_interview_record(existing)
-
-    record = completed_interview_record_from_history(session_id, messages, reason)
-    with INTERVIEW_ARCHIVE_LOCK:
-        archive = load_interview_archive()
-        archive[session_id] = record
-        save_interview_archive(archive)
-
-    logger.info(
-        "interview_archived session_id=%s reason=%s message_count=%s company=%s title=%s",
-        session_id,
-        reason,
-        message_count,
-        record.get("company"),
-        record.get("title"),
-    )
-    return record
-
-
-def archive_idle_interviews_once() -> None:
-    now = time.time()
-    candidates: list[tuple[str, str]] = []
-
-    with MEMORY_LOCK:
-        memory = load_memory()
-        for session_id, messages in memory.items():
-            if not isinstance(messages, list):
-                continue
-            if not any(isinstance(message, dict) and message.get("role") == "user" for message in messages):
-                continue
-
-            last_ts = last_user_message_ts(messages)
-            if not last_ts:
-                continue
-            if now - last_ts >= INTERVIEW_IDLE_ARCHIVE_SECONDS:
-                candidates.append((str(session_id), str(last_ts)))
-
-    with INTERVIEW_ARCHIVE_LOCK:
-        archive = load_interview_archive()
-        filtered_candidates: list[str] = []
-        for session_id, last_ts in candidates:
-            existing = archive.get(session_id)
-            if existing and str(existing.get("_last_user_ts", "")) == last_ts:
-                continue
-            filtered_candidates.append(session_id)
-
-    for session_id in filtered_candidates:
-        try:
-            archive_interview_session(session_id, "idle_timeout")
-        except Exception as exc:
-            logger.exception("interview_idle_archive_failed session_id=%s error=%s", session_id, exc)
-
-
-def archive_export_backfill_interviews_once() -> None:
-    now = time.time()
-    candidates: list[str] = []
-
-    with MEMORY_LOCK:
-        memory = load_memory()
-        with INTERVIEW_ARCHIVE_LOCK:
-            archive = load_interview_archive()
-
-        for session_id, messages in memory.items():
-            if session_id in archive:
-                continue
-            if not isinstance(messages, list):
-                continue
-            if not any(isinstance(message, dict) and message.get("role") == "user" for message in messages):
-                continue
-
-            last_ts = last_user_message_ts(messages)
-            if not last_ts or now - last_ts >= INTERVIEW_IDLE_ARCHIVE_SECONDS:
-                candidates.append(str(session_id))
-
-    for session_id in candidates:
-        try:
-            archive_interview_session(session_id, "export_backfill")
-        except Exception as exc:
-            logger.exception("interview_export_backfill_failed session_id=%s error=%s", session_id, exc)
-
-
-async def interview_archive_sweeper() -> None:
-    while True:
-        await asyncio.sleep(INTERVIEW_ARCHIVE_POLL_SECONDS)
-        try:
-            await asyncio.to_thread(archive_idle_interviews_once)
-        except Exception as exc:
-            logger.exception("interview_archive_sweeper_failed error=%s", exc)
-
-
 @app.on_event("startup")
-async def start_interview_archive_sweeper() -> None:
+async def log_startup() -> None:
     logger.warning(
         "foodwechatbot_startup build=%s file=%s cwd=%s pid=%s database_backend=%s",
         APP_BUILD_LABEL,
@@ -3699,125 +3325,6 @@ async def start_interview_archive_sweeper() -> None:
         os.getpid(),
         os.getenv("DATABASE_BACKEND", "sqlite"),
     )
-    asyncio.create_task(interview_archive_sweeper())
-
-
-def safe_sheet_name(company: str, used_names: set[str]) -> str:
-    base = re.sub(r"[\[\]\*:/\\?]", "_", company).strip()
-    if not base:
-        base = "未确认公司"
-    base = base[:31]
-
-    name = base
-    suffix = 2
-    while name in used_names:
-        suffix_text = f"_{suffix}"
-        name = f"{base[:31 - len(suffix_text)]}{suffix_text}"
-        suffix += 1
-
-    used_names.add(name)
-    return name
-
-
-def write_sheet_rows(sheet, rows: list[list[str]]) -> None:
-    sheet.append(EXPORT_HEADERS)
-    for row in rows:
-        sheet.append(row)
-
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    for cell in sheet[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(vertical="center", wrap_text=True)
-
-    widths = [18, 18, 22, 12, 16, 24, 36, 18, 24, 28, 28, 28, 32, 28, 70]
-    for index, width in enumerate(widths, start=1):
-        sheet.column_dimensions[get_column_letter(index)].width = width
-
-    for row in sheet.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
-
-
-def collect_interview_records() -> list[dict[str, str]]:
-    archive_export_backfill_interviews_once()
-
-    with INTERVIEW_ARCHIVE_LOCK:
-        archive = load_interview_archive()
-
-    with MEMORY_LOCK:
-        memory = load_memory()
-
-    records: list[dict[str, str]] = []
-    archived_session_ids = set()
-    for session_id, record in archive.items():
-        normalized = normalize_interview_record(record)
-        normalized["session_id"] = session_id
-        records.append(normalized)
-        archived_session_ids.add(session_id)
-
-    for session_id, messages in memory.items():
-        if session_id in archived_session_ids:
-            continue
-        if not isinstance(messages, list):
-            continue
-        if not any(message.get("role") == "user" for message in messages if isinstance(message, dict)):
-            continue
-        records.append(interview_record_from_history(session_id, messages))
-
-    return records
-
-
-def record_to_export_row(record: dict[str, str]) -> list[str]:
-    return [
-        record["session_id"],
-        record["updated_at"],
-        record["company"],
-        record["name"],
-        record["title"],
-        record["responsibility"],
-        record["flow"],
-        record["frequency"],
-        record["time_cost"],
-        record["error_impact"],
-        record["current_tools"],
-        record["improvement"],
-        record["data_rules"],
-        record["out_of_scope"],
-        record["transcript"],
-    ]
-
-
-def build_interview_export() -> Path:
-    records = collect_interview_records()
-
-    workbook = Workbook()
-    summary_sheet = workbook.active
-    summary_sheet.title = "全部反馈"
-
-    rows_by_company: dict[str, list[list[str]]] = {}
-    all_rows: list[list[str]] = []
-
-    for record in records:
-        row = record_to_export_row(record)
-        all_rows.append(row)
-        rows_by_company.setdefault(record["company"], []).append(row)
-
-    write_sheet_rows(summary_sheet, all_rows)
-
-    used_sheet_names = {"全部反馈"}
-    for company in sorted(rows_by_company):
-        sheet = workbook.create_sheet(safe_sheet_name(company, used_sheet_names))
-        write_sheet_rows(sheet, rows_by_company[company])
-
-    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = EXPORT_DIR / f"interviews-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
-    workbook.save(output_path)
-    return output_path
 
 
 def collect_order_records() -> list[dict[str, str]]:
@@ -4093,7 +3600,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
     has_existing_draft = order_draft_has_content(existing_draft)
 
     if command in ORDER_CANCEL_COMMANDS:
-        clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+        clear_order_draft(user_id, next_mode=SESSION_MODE_CHAT)
         return ChatResponse(
             user_id=user_id,
             answer="已清空当前订单草稿，并回到普通聊天。要继续录单再发“订单”。",
@@ -4115,7 +3622,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
 
         intent = classify_order_reply_intent(message, existing_draft)
         if intent.intent == INTENT_CANCEL and intent.is_rule:
-            clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+            clear_order_draft(user_id, next_mode=SESSION_MODE_CHAT)
             return ChatResponse(
                 user_id=user_id,
                 answer="已清空当前订单草稿，并回到普通聊天。要继续录单再发“订单”。",
@@ -4369,7 +3876,7 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
     draft = get_receipt_draft(user_id)
     has_existing_draft = receipt_draft_has_content(draft)
     if command in ORDER_CANCEL_COMMANDS:
-        clear_receipt_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+        clear_receipt_draft(user_id, next_mode=SESSION_MODE_CHAT)
         return ChatResponse(
             user_id=user_id,
             answer="已清空当前入库草稿，并回到普通聊天。要继续入库再发“入库”。",
@@ -4379,7 +3886,7 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
     if has_existing_draft:
         intent = classify_receipt_reply_intent(message, draft)
         if intent.intent == INTENT_CANCEL and intent.is_rule:
-            clear_receipt_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+            clear_receipt_draft(user_id, next_mode=SESSION_MODE_CHAT)
             return ChatResponse(
                 user_id=user_id,
                 answer="已清空当前入库草稿，并回到普通聊天。要继续入库再发“入库”。",
@@ -4548,7 +4055,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             history_length=user_order_count(user_id),
         )
 
-    if is_exit_mode_command(command) or command in INTERVIEW_MODE_COMMANDS:
+    if is_exit_mode_command(command):
         return ChatResponse(
             user_id=user_id,
             answer=exit_business_mode(user_id),
@@ -4557,16 +4064,16 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
 
     if command in ORDER_CANCEL_COMMANDS:
         if has_receipt_draft and not has_order_draft:
-            clear_receipt_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+            clear_receipt_draft(user_id, next_mode=SESSION_MODE_CHAT)
             answer = "已清空当前入库草稿，并回到普通聊天。"
         elif has_order_draft and not has_receipt_draft:
-            clear_order_draft(user_id, next_mode=SESSION_MODE_INTERVIEW)
+            clear_order_draft(user_id, next_mode=SESSION_MODE_CHAT)
             answer = "已清空当前订单草稿，并回到普通聊天。"
         else:
             record = get_session_record(user_id)
             record.pop("order_draft", None)
             record.pop("receipt_draft", None)
-            record["mode"] = SESSION_MODE_INTERVIEW
+            record["mode"] = SESSION_MODE_CHAT
             save_session_record(user_id, record)
             answer = "已清空当前草稿，并回到普通聊天。"
         return ChatResponse(user_id=user_id, answer=answer, history_length=0)
@@ -5349,27 +4856,6 @@ def handle_photo_order_input(user_id: str, image_bytes: bytes, mime_type: str | 
     )
 
 
-def maybe_archive_wecom_kf_event(event_info: dict[str, Any]) -> None:
-    event_type = str(event_info.get("event_type") or "")
-    open_kfid = str(event_info.get("open_kfid") or "")
-    external_userid = str(event_info.get("external_userid") or "")
-    if not open_kfid or not external_userid:
-        return
-
-    should_archive = event_type in ARCHIVE_EVENT_TYPES
-    if event_type == "session_status_change":
-        try:
-            should_archive = int(event_info.get("change_type", 0)) == 3
-        except (TypeError, ValueError):
-            should_archive = False
-
-    if not should_archive:
-        return
-
-    session_id = f"kf:{open_kfid}:{external_userid}"
-    archive_interview_session(session_id, f"kf_event:{event_type}")
-
-
 def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
     msg_id = str(item.get("msgid") or "")
     if is_duplicate_wecom_kf_message(msg_id):
@@ -5390,10 +4876,7 @@ def handle_wecom_kf_sync_item(item: dict[str, Any]) -> None:
     )
 
     if msg_type == "event":
-        event_info = item.get("event", {})
-        logger.info("wecom_kf_event msg_id=%s event=%s", msg_id, event_info)
-        if isinstance(event_info, dict):
-            maybe_archive_wecom_kf_event(event_info)
+        logger.info("wecom_kf_event msg_id=%s event=%s", msg_id, item.get("event", {}))
         return
 
     session_id = f"kf:{open_kfid}:{external_userid}" if open_kfid and external_userid else ""
@@ -5853,7 +5336,7 @@ def export_page(request: Request):
               <head>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>访谈导出</title>
+                <title>订单导出</title>
                 <style>
                   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 48px; color: #172033; }
                   main { max-width: 520px; }
@@ -5865,7 +5348,7 @@ def export_page(request: Request):
               </head>
               <body>
                 <main>
-                  <h1>访谈导出</h1>
+                  <h1>订单导出</h1>
                   <p>请输入导出口令后进入导出页。</p>
                   <form method="get" action="/exports">
                     <label for="token">导出口令</label>
@@ -5878,17 +5361,18 @@ def export_page(request: Request):
             """
         )
 
-    records = collect_interview_records()
-    companies = sorted({record["company"] for record in records})
-    download_url = "/exports/interviews.xlsx"
+    records = collect_order_records()
+    order_ids = sorted({record["id"] for record in records if record.get("id")})
+    stores = sorted({record["store"] for record in records if record.get("store")})
+    download_url = "/exports/orders.xlsx"
     if token:
         download_url = f"{download_url}?token={token}"
 
-    company_items = "".join(f"<li>{company}</li>" for company in companies[:30])
-    if len(companies) > 30:
-        company_items += f"<li>还有 {len(companies) - 30} 个公司...</li>"
-    if not company_items:
-        company_items = "<li>暂无公司数据</li>"
+    store_items = "".join(f"<li>{store}</li>" for store in stores[:30])
+    if len(stores) > 30:
+        store_items += f"<li>还有 {len(stores) - 30} 个门店...</li>"
+    if not store_items:
+        store_items = "<li>暂无门店数据</li>"
 
     return HTMLResponse(
         f"""
@@ -5897,7 +5381,7 @@ def export_page(request: Request):
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>访谈导出</title>
+            <title>订单导出</title>
             <style>
               body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 48px; color: #172033; background: #f6f8fb; }}
               main {{ max-width: 880px; }}
@@ -5912,31 +5396,19 @@ def export_page(request: Request):
           </head>
           <body>
             <main class="panel">
-              <h1>访谈导出</h1>
-              <p>点击按钮生成并下载 Excel。文件包含“全部反馈”和每个公司的独立 sheet。</p>
+              <h1>订单导出</h1>
+              <p>点击按钮生成并下载 Excel。文件包含“全部订单”和“按门店商品汇总”两个 sheet。</p>
               <div class="stats">
-                <div class="stat"><strong>{len(records)}</strong>访谈记录</div>
-                <div class="stat"><strong>{len(companies)}</strong>公司分表</div>
+                <div class="stat"><strong>{len(order_ids)}</strong>订单数</div>
+                <div class="stat"><strong>{len(stores)}</strong>门店数</div>
               </div>
               <a class="button" href="{download_url}">下载 Excel</a>
-              <h2>当前公司</h2>
-              <ul>{company_items}</ul>
+              <h2>当前门店</h2>
+              <ul>{store_items}</ul>
             </main>
           </body>
         </html>
         """
-    )
-
-
-@app.get("/exports/interviews.xlsx")
-def export_interviews(request: Request):
-    require_export_token(request)
-
-    output_path = build_interview_export()
-    return FileResponse(
-        output_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=output_path.name,
     )
 
 

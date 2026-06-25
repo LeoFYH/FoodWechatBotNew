@@ -53,7 +53,6 @@ class ExcelParsingTests(unittest.TestCase):
                 "SESSION_STATE_FILE": str(root / "session_state.json"),
                 "ORDER_DB_FILE": str(root / "orders.db"),
                 "RECEIPT_DB_FILE": str(root / "receipts.db"),
-                "INTERVIEW_ARCHIVE_FILE": str(root / "interviews.json"),
                 "WECOM_KF_CURSOR_FILE": str(root / "kf_cursors.json"),
                 "EXPORT_DIR": str(root / "exports"),
             },

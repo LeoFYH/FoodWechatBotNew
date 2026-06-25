@@ -21,7 +21,6 @@ class RoutingStateTests(unittest.TestCase):
                 "SESSION_STATE_FILE": str(root / "session_state.json"),
                 "ORDER_DB_FILE": str(root / "orders.db"),
                 "RECEIPT_DB_FILE": str(root / "receipts.db"),
-                "INTERVIEW_ARCHIVE_FILE": str(root / "interviews.json"),
                 "WECOM_KF_CURSOR_FILE": str(root / "kf_cursors.json"),
                 "EXPORT_DIR": str(root / "exports"),
             },
@@ -43,18 +42,18 @@ class RoutingStateTests(unittest.TestCase):
     def test_question_with_confirm_word_transfers_to_human(self) -> None:
         response = self.main.handle_user_message("u1", "发票可以开吗")
         self.assertIn("转人工", response.answer)
-        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_CHAT)
 
     def test_order_query_does_not_switch_to_order_mode(self) -> None:
         response = self.main.handle_user_message("u1", "查一下订单")
         self.assertIn("订单只有", response.answer)
-        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_CHAT)
 
     def test_negated_receipt_text_does_not_enter_receipt_mode(self) -> None:
         with self.stub_chat():
             response = self.main.handle_user_message("u1", "不要入库")
         self.assertEqual(response.answer, "普通回复")
-        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_CHAT)
 
     def test_plain_order_text_routes_to_order_parser(self) -> None:
         expected = self.main.ChatResponse(user_id="u1", answer="订单解析", history_length=0)
@@ -129,7 +128,7 @@ class RoutingStateTests(unittest.TestCase):
         )
         response = self.main.handle_user_message("u1", "取消")
         self.assertIn("回到普通聊天", response.answer)
-        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_INTERVIEW)
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_CHAT)
         self.assertFalse(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
 
     def test_receipt_modify_routes_to_skill_and_saves(self) -> None:
