@@ -2203,81 +2203,6 @@ def llm_order_draft_from_message(existing_draft: dict[str, Any], message: str) -
     return normalized
 
 
-def llm_parse_order_draft(existing_draft: dict[str, Any], message: str) -> dict[str, Any]:
-    existing_kind = existing_draft.get("kind") if isinstance(existing_draft, dict) else ""
-    if existing_kind == ORDER_KIND_BASE:
-        schema_hint = """
-输出基础订单 JSON：
-{
-  "kind":"base","source":"photo","store":"","order_no":"","orderer":"",
-  "order_date":"","deliver_date":"",
-  "items":[{"code":"","name":"","spec":"","unit":"","qty":0,"price":null,"category":""}],
-  "confirmed":false,"status":"new","raw_ref":"","created_at":""
-}
-""".strip()
-        task_hint = "已有草稿是照片/Excel基础订单。新消息通常是在纠错或补充字段，请合并到已有基础订单里。"
-    else:
-        schema_hint = """
-输出文字补丁 JSON：
-{
-  "kind":"patch","source":"text","store":"",
-  "items":[{"code":null,"name":"","spec":null,"unit":"","qty":0}],
-  "change_type":"add","order_date":"","deliver_date":"",
-  "confirmed":false,"status":"new","raw_text":"","raw_ref":"","created_at":""
-}
-""".strip()
-        task_hint = "新消息是群里文字加货/改量。只负责问清门店、商品、数量，不要挂靠到具体订单。"
-
-    today = datetime.now().date().isoformat()
-    prompt = f"""
-你是通用订单机器人。请按接口契约把微信消息整理成 Web 工具可直接使用的 JSON。
-
-只输出一个 JSON 对象，不要解释，不要 Markdown。
-
-{task_hint}
-
-今天日期：{today}
-
-字段要求：
-- base 用于标准 Excel 或照片订单；patch 用于文字加货/改量。
-- store 是门店/区域，必须尽量从原文提取。
-- order_date 是下单日期/归属日期，是 Web 工具归批字段。文字里出现“6.21订”“6月21日订”“2026-6-21下单”时，必须填 order_date=YYYY-MM-DD。
-- qty、price 输出数字；缺失用 null。
-- code 可能为空或 "#N/A"，照实保留。
-- 文本里出现“加、追加、再来、补”通常 change_type=add；出现“改、换成、数量改为”通常 change_type=modify。
-- deliver_date 只是可选送达备注。文字里出现送达/到货时间时可以填；不要用 deliver_date 替代 order_date。
-- created_at 表示消息收到时间，不要从用户文本推断，不要填送达时间。
-- 信息没出现不要编造，留空字符串或 null。
-
-{schema_hint}
-
-已有草稿：
-{json.dumps(existing_draft, ensure_ascii=False)}
-
-新消息：
-{message}
-""".strip()
-
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "你只输出可解析 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-    )
-    raw = response.choices[0].message.content or ""
-    parsed = extract_json_object(raw)
-    if parsed.get("kind") == ORDER_KIND_PATCH:
-        parsed["raw_text"] = parsed.get("raw_text") or message
-    explicit_order_date = extract_explicit_order_date(message)
-    if explicit_order_date:
-        parsed["order_date"] = explicit_order_date
-    parsed["created_at"] = existing_draft.get("created_at") if isinstance(existing_draft, dict) else ""
-    parsed["created_at"] = parsed["created_at"] or now_iso()
-    return normalize_order_draft(parsed)
-
-
 def normalize_excel_header(value: Any) -> str:
     text = clean_order_value(value).lower()
     return re.sub(r"[\s:_：/\\（）()\[\]【】\-]+", "", text)
@@ -4912,11 +4837,10 @@ async def api_import_photo(
 def api_import_text(request: Request, payload: TextOrderImportRequest) -> dict[str, Any]:
     require_robot_api_token(request)
     raw_ref = payload.raw_ref or f"api:text:{payload.user_id}"
-    try:
-        draft = llm_parse_order_draft({}, payload.message)
-    except Exception as exc:
-        logger.warning("api_text_import_failed user_id=%s error=%s", payload.user_id, exc)
-        raise HTTPException(status_code=400, detail="Text order parse failed") from exc
+    draft = llm_order_draft_from_message({}, payload.message)
+    if not draft:
+        logger.warning("api_text_import_failed user_id=%s", payload.user_id)
+        raise HTTPException(status_code=400, detail="Text order parse failed")
 
     draft["raw_ref"] = raw_ref
     draft["raw_text"] = draft.get("raw_text") or payload.message
