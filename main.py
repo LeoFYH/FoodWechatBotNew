@@ -3714,10 +3714,8 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         return handle_order_user_message(user_id, inline_order_message, raw_ref=raw_ref)
 
     if current_mode == SESSION_MODE_ORDER:
-        if looks_like_order_message(message):
-            return handle_order_user_message(user_id, message, raw_ref=raw_ref)
-        # 关键词没认出来时再问一次大脑：在订单模式下，这很可能是表达复杂的订单内容，
-        # 不该直接当成闲聊丢掉。大脑判为 order_text 才进订单流程，否则才走普通聊天。
+        # 订单模式里也不靠关键词硬判：一律问分诊大脑（规则在 skills/routing/SKILL.md，你可改）。
+        # 只有判为"给了具体商品内容"才录单；问句/想改但没给内容 → 自然聊天接住，不怼"解析失败"。
         order_mode_route = agent_router.decide_from_llm(
             message,
             mode=SESSION_MODE_ORDER,
