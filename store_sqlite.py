@@ -27,6 +27,16 @@ from order_normalize import (
     normalize_order_payload,
     now_iso,
 )
+from receipt_logic import (
+    RECEIPT_STATUS_CANCELLED,
+    RECEIPT_STATUS_CONFIRMED,
+    RECEIPT_STATUS_FETCHED,
+    normalize_receipt_payload,
+    parse_receipt_id_values,
+    receipt_id_label,
+    receipt_status_to_storage_filter,
+    summarize_receipt_for_reply,
+)
 
 
 def init_order_db(db_file: Path) -> None:
@@ -332,7 +342,216 @@ def cancel_latest_order_for_user(user_id: str, *, db_file: Path, lock: Any) -> s
             return f"好，刚那单（{summarize_order_for_reply(payload)}）撤回了，重新发我吧。"
 
 
+# ============================== receipt(产成品入库)SQLite 后端 ==============================
+# 与 order 同样:db_file/lock 由 main 注入;领域归一化/状态/编号 helper 自 receipt_logic 导入。
+
+
+def raw_ref_belongs_to_user(raw_ref: str, user_id: str) -> bool:
+    raw_ref = str(raw_ref or "")
+    return raw_ref == user_id or raw_ref.startswith(f"{user_id}:")
+
+
+def init_receipt_db(db_file: Path) -> None:
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS receipt_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(receipt_entries)").fetchall()
+        }
+        if "status" not in columns:
+            conn.execute("ALTER TABLE receipt_entries ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_entries_date ON receipt_entries(date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_entries_status_date ON receipt_entries(status, date)")
+        conn.commit()
+
+
+def receipt_db_connection(db_file: Path) -> sqlite3.Connection:
+    init_receipt_db(db_file)
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def row_to_receipt_payload(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["date"] = str(row["date"] or payload.get("date") or "")
+    payload["status"] = str(row["status"] or payload.get("status") or RECEIPT_STATUS_CONFIRMED)
+    normalized = normalize_receipt_payload(payload)
+    normalized["id"] = f"r{int(row['id']):03d}"
+    normalized["date"] = str(row["date"] or normalized.get("date") or "")
+    return {
+        "id": normalized["id"],
+        "date": normalized["date"],
+        "items": normalized.get("items") or [],
+    }
+
+
+def insert_receipt_payload(normalized: dict[str, Any], *, db_file: Path, lock: Any) -> dict[str, Any]:
+    with lock:
+        with receipt_db_connection(db_file) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO receipt_entries (
+                    date, status, created_at, updated_at, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(normalized.get("date") or ""),
+                    str(normalized.get("status") or "confirmed"),
+                    str(normalized.get("created_at") or now_iso()),
+                    now_iso(),
+                    json.dumps(normalized, ensure_ascii=False),
+                ),
+            )
+            receipt_id = int(cursor.lastrowid)
+            normalized["id"] = f"r{receipt_id:03d}"
+            conn.execute(
+                "UPDATE receipt_entries SET payload_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(normalized, ensure_ascii=False), now_iso(), receipt_id),
+            )
+            conn.commit()
+    return {
+        "id": str(normalized["id"]),
+        "date": str(normalized.get("date") or ""),
+        "items": normalized.get("items") or [],
+    }
+
+
+def query_receipt_payloads_by_status(date: str, status: str | None = None, *, db_file: Path) -> list[dict[str, Any]]:
+    storage_status = receipt_status_to_storage_filter(status)
+    clauses = ["date = ?", "status != ?"]
+    params: list[Any] = [date, RECEIPT_STATUS_CANCELLED]
+    if storage_status:
+        clauses.append("status = ?")
+        params.append(storage_status)
+    where_sql = " AND ".join(clauses)
+    with receipt_db_connection(db_file) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM receipt_entries WHERE {where_sql} ORDER BY id ASC",
+            params,
+        ).fetchall()
+    return [row_to_receipt_payload(row) for row in rows]
+
+
+def update_receipt_payload_status(
+    ids: list[Any],
+    target_status: str,
+    *,
+    db_file: Path,
+    lock: Any,
+) -> dict[str, list[str]]:
+    clean_ids, failed = parse_receipt_id_values(ids)
+    if not clean_ids:
+        return {"succeeded": [], "failed": failed}
+
+    placeholders = ",".join("?" for _ in clean_ids)
+    with lock:
+        with receipt_db_connection(db_file) as conn:
+            existing_rows = conn.execute(
+                f"SELECT id FROM receipt_entries WHERE id IN ({placeholders}) AND status != ?",
+                [*clean_ids, RECEIPT_STATUS_CANCELLED],
+            ).fetchall()
+            existing_ids = {int(row["id"]) for row in existing_rows}
+            succeeded_ints = [receipt_id for receipt_id in clean_ids if receipt_id in existing_ids]
+            failed.extend(receipt_id_label(receipt_id) for receipt_id in clean_ids if receipt_id not in existing_ids)
+
+            if not succeeded_ints:
+                return {"succeeded": [], "failed": failed}
+
+            update_placeholders = ",".join("?" for _ in succeeded_ints)
+            conn.execute(
+                f"""
+                UPDATE receipt_entries
+                SET status = ?,
+                    updated_at = ?
+                WHERE id IN ({update_placeholders})
+                """,
+                [target_status, now_iso(), *succeeded_ints],
+            )
+            rows = conn.execute(
+                f"SELECT * FROM receipt_entries WHERE id IN ({update_placeholders})",
+                succeeded_ints,
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                except json.JSONDecodeError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload["status"] = target_status
+                conn.execute(
+                    "UPDATE receipt_entries SET payload_json = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), int(row["id"])),
+                )
+            conn.commit()
+            return {
+                "succeeded": [receipt_id_label(receipt_id) for receipt_id in succeeded_ints],
+                "failed": failed,
+            }
+
+
+def cancel_latest_receipt_for_user(user_id: str, today: str, *, db_file: Path, lock: Any) -> str:
+    with lock:
+        with receipt_db_connection(db_file) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM receipt_entries
+                WHERE date = ? AND status != 'cancelled'
+                ORDER BY id DESC
+                """,
+                (today,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                except json.JSONDecodeError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                if not raw_ref_belongs_to_user(str(payload.get("raw_ref") or ""), user_id):
+                    continue
+
+                status = str(row["status"] or payload.get("status") or "")
+                if status == RECEIPT_STATUS_FETCHED:
+                    return "这条入库记录已被入库工具使用，不能直接撤回，需要联系数据部处理。"
+
+                payload["status"] = RECEIPT_STATUS_CANCELLED
+                payload["cancelled_at"] = now_iso()
+                conn.execute(
+                    """
+                    UPDATE receipt_entries
+                    SET status = 'cancelled', payload_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(payload, ensure_ascii=False), now_iso(), int(row["id"])),
+                )
+                conn.commit()
+                return f"好，刚那条入库记录（{summarize_receipt_for_reply(payload)}）撤回了。"
+    return "没找到你今天确认的入库记录，暂时没有可撤回的。"
+
+
 __all__ = [
+    # order
     "init_order_db",
     "order_db_connection",
     "row_to_order_payload",
@@ -342,4 +561,13 @@ __all__ = [
     "mark_order_payloads_fetched",
     "unmark_order_payloads",
     "cancel_latest_order_for_user",
+    # receipt
+    "raw_ref_belongs_to_user",
+    "init_receipt_db",
+    "receipt_db_connection",
+    "row_to_receipt_payload",
+    "insert_receipt_payload",
+    "query_receipt_payloads_by_status",
+    "update_receipt_payload_status",
+    "cancel_latest_receipt_for_user",
 ]

@@ -5,8 +5,8 @@
 铁律(e):OpenAI vision client 与 model 留在 main,本模块**只通过参数接收** client/model,
 自身不持有 client、不读 env、不 import main。依赖的纯函数从叶子模块(order_normalize/llm_json)导入。
 
-注意:产成品入库照片识别 llm_parse_receipt_photo 依赖入库领域归一化(normalize_receipt_payload),
-该函数尚在 main、待 P6 receipt_logic 抽出,故 receipt 照片识别留到 P6 一并搬入,本阶段不在此模块。
+订单照片 llm_parse_photo_order 用 order_normalize;产成品入库照片 llm_parse_receipt_photo
+用 receipt_logic 的 normalize_receipt_payload(P6 接入)。两者都通过参数接收 client/model。
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from order_normalize import (
     normalize_order_payload,
     now_iso,
 )
+from receipt_logic import normalize_receipt_payload
 
 
 def image_data_uri(image_bytes: bytes, mime_type: str | None) -> str:
@@ -105,9 +106,40 @@ def llm_parse_photo_order(client: Any, model: str, image_bytes: bytes, mime_type
     return normalize_order_payload(parsed)
 
 
+def llm_parse_receipt_photo(client: Any, model: str, image_bytes: bytes, mime_type: str | None, raw_ref: str) -> dict[str, Any]:
+    today = datetime.now().date().isoformat()
+    prompt = f"""
+你是产成品入库照片识别助手。请读取车间发来的产成品入库照片，只识别成品名称和数量清单。
+
+只输出一个 JSON 对象，不要解释，不要 Markdown。
+
+格式：
+{{
+  "date": "YYYY-MM-DD",
+  "items": [
+    {{"code": null, "name": "成品名称", "spec": null, "unit": "箱", "qty": 50}}
+  ]
+}}
+
+规则：
+- 今天日期：{today}
+- date 是车间入库日期。图片里有日期就按图片日期；没有日期就填今天。
+- 不要输出 store，入库是车间总量，不分门店。
+- items[].qty 必须是数字，不要带“箱/袋/件”等单位字。
+- 单位放到 unit；识别不到单位填 null。
+- code/spec 可选，识别不到填 null。
+- 不要编造图片里没有的成品。
+""".strip()
+    parsed = call_vision_json(client, model, prompt, image_bytes, mime_type)
+    parsed["raw_ref"] = raw_ref
+    parsed["created_at"] = now_iso()
+    return normalize_receipt_payload(parsed)
+
+
 __all__ = [
     "image_data_uri",
     "ensure_vision_recognition_ready",
     "call_vision_json",
     "llm_parse_photo_order",
+    "llm_parse_receipt_photo",
 ]

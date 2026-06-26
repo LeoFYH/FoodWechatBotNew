@@ -54,6 +54,7 @@ from llm_json import *  # 大模型输出 JSON 提取通用 helper（门面 re-e
 from vision_import import *  # 视觉/照片解析层（client/model 由 main 注入；门面 re-export）
 from order_export import *  # 订单 xlsx 导出层（records/export_dir 由 main 注入；门面 re-export）
 from store_sqlite import summarize_order_for_reply  # 撤回回复模板（models 分支格式化用；SQLite 分支在 store_sqlite 内自用）
+from receipt_logic import *  # 入库(receipt)领域：RECEIPT 常量 + 归一化/missing/summarize/status helper（门面 re-export）
 
 load_dotenv()
 
@@ -356,11 +357,6 @@ def unmark_order_payloads(ids: list[int]) -> dict[str, list[int]]:
     return store_sqlite.unmark_order_payloads(ids, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
 
 
-def raw_ref_belongs_to_user(raw_ref: str, user_id: str) -> bool:
-    raw_ref = str(raw_ref or "")
-    return raw_ref == user_id or raw_ref.startswith(f"{user_id}:")
-
-
 def cancel_latest_order_for_user(user_id: str) -> str:
     if models.is_enabled():
         result = models.cancel_latest_order_for_user(user_id)
@@ -374,19 +370,6 @@ def cancel_latest_order_for_user(user_id: str) -> str:
     return store_sqlite.cancel_latest_order_for_user(user_id, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
 
 
-def summarize_receipt_for_reply(payload: dict[str, Any]) -> str:
-    items = payload.get("items") if isinstance(payload.get("items"), list) else []
-    if not items:
-        return str(payload.get("date") or "今天")
-    first = items[0] if isinstance(items[0], dict) else {}
-    name = str(first.get("name") or "未填成品")
-    qty = first.get("qty")
-    unit = str(first.get("unit") or "")
-    qty_text = "" if qty is None else f"{qty}{unit}"
-    more = "" if len(items) == 1 else f"等{len(items)}项"
-    return f"{name}{qty_text}{more}".strip()
-
-
 def cancel_latest_receipt_for_user(user_id: str) -> str:
     today = datetime.now().date().isoformat()
     if models.is_enabled():
@@ -398,43 +381,7 @@ def cancel_latest_receipt_for_user(user_id: str) -> str:
             return "这条入库记录已被入库工具使用，不能直接撤回，需要联系数据部处理。"
         return "没找到你今天确认的入库记录，暂时没有可撤回的。"
 
-    with RECEIPT_DB_LOCK:
-        with receipt_db_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM receipt_entries
-                WHERE date = ? AND status != 'cancelled'
-                ORDER BY id DESC
-                """,
-                (today,),
-            ).fetchall()
-            for row in rows:
-                try:
-                    payload = json.loads(str(row["payload_json"]))
-                except json.JSONDecodeError:
-                    payload = {}
-                if not isinstance(payload, dict):
-                    payload = {}
-                if not raw_ref_belongs_to_user(str(payload.get("raw_ref") or ""), user_id):
-                    continue
-
-                status = str(row["status"] or payload.get("status") or "")
-                if status == RECEIPT_STATUS_FETCHED:
-                    return "这条入库记录已被入库工具使用，不能直接撤回，需要联系数据部处理。"
-
-                payload["status"] = RECEIPT_STATUS_CANCELLED
-                payload["cancelled_at"] = now_iso()
-                conn.execute(
-                    """
-                    UPDATE receipt_entries
-                    SET status = 'cancelled', payload_json = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (json.dumps(payload, ensure_ascii=False), now_iso(), int(row["id"])),
-                )
-                conn.commit()
-                return f"好，刚那条入库记录（{summarize_receipt_for_reply(payload)}）撤回了。"
-    return "没找到你今天确认的入库记录，暂时没有可撤回的。"
+    return store_sqlite.cancel_latest_receipt_for_user(user_id, today, db_file=RECEIPT_DB_FILE, lock=RECEIPT_DB_LOCK)
 
 
 def order_draft_has_content(draft: dict[str, Any]) -> bool:
@@ -466,126 +413,6 @@ def missing_fields_reply(missing: list[str], *, receipt: bool = False) -> str:
     return f"{subject}还差：{'、'.join(missing)}。补我一下就行，发“取消”可以清空草稿。"
 
 
-def init_receipt_db() -> None:
-    RECEIPT_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(RECEIPT_DB_FILE) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS receipt_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'confirmed',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            )
-            """
-        )
-        columns = {
-            str(row[1])
-            for row in conn.execute("PRAGMA table_info(receipt_entries)").fetchall()
-        }
-        if "status" not in columns:
-            conn.execute("ALTER TABLE receipt_entries ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_entries_date ON receipt_entries(date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_entries_status_date ON receipt_entries(status, date)")
-        conn.commit()
-
-
-def receipt_db_connection() -> sqlite3.Connection:
-    init_receipt_db()
-    conn = sqlite3.connect(RECEIPT_DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def normalize_receipt_item(item: dict[str, Any]) -> dict[str, Any]:
-    normalized = {
-        "code": optional_text(item.get("code"), null_for_empty=True),
-        "name": optional_text(item.get("name")) or "",
-        "spec": optional_text(item.get("spec"), null_for_empty=True),
-        "unit": optional_text(item.get("unit"), null_for_empty=True),
-        "qty": normalize_number(item.get("qty")),
-    }
-    return normalized
-
-
-def normalize_receipt_payload(data: dict[str, Any]) -> dict[str, Any]:
-    created_at = clean_order_value(data.get("created_at")) or now_iso()
-    date = normalize_order_date_text(data.get("date")) or fallback_order_date(created_at)
-    status = clean_order_value(data.get("status")) or RECEIPT_STATUS_CONFIRMED
-    if status == RECEIPT_STATUS_NEW:
-        status = RECEIPT_STATUS_CONFIRMED
-    if status not in RECEIPT_STORAGE_STATUSES:
-        status = RECEIPT_STATUS_CONFIRMED
-    items = data.get("items")
-    if not isinstance(items, list):
-        items = []
-
-    normalized_items = [
-        normalize_receipt_item(item)
-        for item in items
-        if isinstance(item, dict)
-    ]
-    normalized_items = [
-        item
-        for item in normalized_items
-        if item.get("name") or item.get("qty") is not None
-    ]
-
-    payload: dict[str, Any] = {
-        "date": date,
-        "items": normalized_items,
-        "status": status,
-        "created_at": created_at,
-    }
-    if data.get("id") not in (None, ""):
-        payload["id"] = str(data.get("id"))
-    if data.get("raw_ref"):
-        payload["raw_ref"] = clean_order_value(data.get("raw_ref"))
-    return payload
-
-
-def receipt_missing_fields(payload: dict[str, Any]) -> list[str]:
-    missing: list[str] = []
-    if not payload.get("date"):
-        missing.append("入库日期")
-    items = payload.get("items")
-    if not isinstance(items, list) or not items:
-        missing.append("成品和数量")
-        return missing
-
-    for index, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            missing.append(f"第{index}项成品")
-            continue
-        if not item.get("name"):
-            missing.append(f"第{index}项成品名称")
-        if item.get("qty") is None:
-            missing.append(f"第{index}项数量")
-    return missing
-
-
-def row_to_receipt_payload(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        payload = json.loads(str(row["payload_json"]))
-    except json.JSONDecodeError:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    payload["date"] = str(row["date"] or payload.get("date") or "")
-    payload["status"] = str(row["status"] or payload.get("status") or RECEIPT_STATUS_CONFIRMED)
-    normalized = normalize_receipt_payload(payload)
-    normalized["id"] = f"r{int(row['id']):03d}"
-    normalized["date"] = str(row["date"] or normalized.get("date") or "")
-    return {
-        "id": normalized["id"],
-        "date": normalized["date"],
-        "items": normalized.get("items") or [],
-    }
-
-
 def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_receipt_payload(payload)
     missing = receipt_missing_fields(normalized)
@@ -595,74 +422,11 @@ def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if models.is_enabled():
         return models.insert_receipt_payload(normalized)
 
-    with RECEIPT_DB_LOCK:
-        with receipt_db_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO receipt_entries (
-                    date, status, created_at, updated_at, payload_json
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    str(normalized.get("date") or ""),
-                    str(normalized.get("status") or "confirmed"),
-                    str(normalized.get("created_at") or now_iso()),
-                    now_iso(),
-                    json.dumps(normalized, ensure_ascii=False),
-                ),
-            )
-            receipt_id = int(cursor.lastrowid)
-            normalized["id"] = f"r{receipt_id:03d}"
-            conn.execute(
-                "UPDATE receipt_entries SET payload_json = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(normalized, ensure_ascii=False), now_iso(), receipt_id),
-            )
-            conn.commit()
-    return {
-        "id": str(normalized["id"]),
-        "date": str(normalized.get("date") or ""),
-        "items": normalized.get("items") or [],
-    }
+    return store_sqlite.insert_receipt_payload(normalized, db_file=RECEIPT_DB_FILE, lock=RECEIPT_DB_LOCK)
 
 
 def query_receipt_payloads(date: str) -> list[dict[str, Any]]:
     return query_receipt_payloads_by_status(date, RECEIPT_STATUS_NEW)
-
-
-def receipt_status_to_storage_filter(status: str | None) -> str | None:
-    if not status or status == RECEIPT_STATUS_NEW:
-        return RECEIPT_STATUS_CONFIRMED
-    if status == RECEIPT_STATUS_ALL:
-        return None
-    return status
-
-
-def receipt_id_label(receipt_id: int) -> str:
-    return f"r{int(receipt_id):03d}"
-
-
-def parse_receipt_id_values(ids: list[Any]) -> tuple[list[int], list[str]]:
-    clean_ids: list[int] = []
-    failed: list[str] = []
-    seen: set[int] = set()
-    for raw_id in ids:
-        text = str(raw_id or "").strip()
-        if text.lower().startswith("r"):
-            text = text[1:]
-        try:
-            receipt_id = int(text)
-        except ValueError:
-            failed.append(str(raw_id))
-            continue
-        if receipt_id <= 0:
-            failed.append(str(raw_id))
-            continue
-        if receipt_id in seen:
-            continue
-        seen.add(receipt_id)
-        clean_ids.append(receipt_id)
-    return sorted(clean_ids), failed
 
 
 def update_receipt_payload_status(
@@ -674,55 +438,7 @@ def update_receipt_payload_status(
             return models.mark_receipt_payloads_fetched(ids)
         return models.unmark_receipt_payloads(ids)
 
-    clean_ids, failed = parse_receipt_id_values(ids)
-    if not clean_ids:
-        return {"succeeded": [], "failed": failed}
-
-    placeholders = ",".join("?" for _ in clean_ids)
-    with RECEIPT_DB_LOCK:
-        with receipt_db_connection() as conn:
-            existing_rows = conn.execute(
-                f"SELECT id FROM receipt_entries WHERE id IN ({placeholders}) AND status != ?",
-                [*clean_ids, RECEIPT_STATUS_CANCELLED],
-            ).fetchall()
-            existing_ids = {int(row["id"]) for row in existing_rows}
-            succeeded_ints = [receipt_id for receipt_id in clean_ids if receipt_id in existing_ids]
-            failed.extend(receipt_id_label(receipt_id) for receipt_id in clean_ids if receipt_id not in existing_ids)
-
-            if not succeeded_ints:
-                return {"succeeded": [], "failed": failed}
-
-            update_placeholders = ",".join("?" for _ in succeeded_ints)
-            conn.execute(
-                f"""
-                UPDATE receipt_entries
-                SET status = ?,
-                    updated_at = ?
-                WHERE id IN ({update_placeholders})
-                """,
-                [target_status, now_iso(), *succeeded_ints],
-            )
-            rows = conn.execute(
-                f"SELECT * FROM receipt_entries WHERE id IN ({update_placeholders})",
-                succeeded_ints,
-            ).fetchall()
-            for row in rows:
-                try:
-                    payload = json.loads(str(row["payload_json"]))
-                except json.JSONDecodeError:
-                    payload = {}
-                if not isinstance(payload, dict):
-                    payload = {}
-                payload["status"] = target_status
-                conn.execute(
-                    "UPDATE receipt_entries SET payload_json = ? WHERE id = ?",
-                    (json.dumps(payload, ensure_ascii=False), int(row["id"])),
-                )
-            conn.commit()
-            return {
-                "succeeded": [receipt_id_label(receipt_id) for receipt_id in succeeded_ints],
-                "failed": failed,
-            }
+    return store_sqlite.update_receipt_payload_status(ids, target_status, db_file=RECEIPT_DB_FILE, lock=RECEIPT_DB_LOCK)
 
 
 def mark_receipt_payloads_fetched(ids: list[Any]) -> dict[str, list[str]]:
@@ -737,19 +453,7 @@ def query_receipt_payloads_by_status(date: str, status: str | None = None) -> li
     if models.is_enabled():
         return models.query_receipt_payloads(date, status=status)
 
-    storage_status = receipt_status_to_storage_filter(status)
-    clauses = ["date = ?", "status != ?"]
-    params: list[Any] = [date, RECEIPT_STATUS_CANCELLED]
-    if storage_status:
-        clauses.append("status = ?")
-        params.append(storage_status)
-    where_sql = " AND ".join(clauses)
-    with receipt_db_connection() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM receipt_entries WHERE {where_sql} ORDER BY id ASC",
-            params,
-        ).fetchall()
-    return [row_to_receipt_payload(row) for row in rows]
+    return store_sqlite.query_receipt_payloads_by_status(date, status, db_file=RECEIPT_DB_FILE)
 
 
 SESSION_MODE_CHAT = "chat"
@@ -848,13 +552,7 @@ GLOBAL_ROUTE_UNCLEAR = "unclear"
 # 订单领域常量（ORDER_KIND_*/ORDER_SOURCE_*/ORDER_STATUS_*/ORDER_CHANGE_*/
 # ORDER_KINDS/ORDER_SOURCES/ORDER_STATUSES/ORDER_CHANGE_TYPES/BASE_ORDER_FIELDS/
 # PATCH_ORDER_FIELDS）已移至 order_normalize.py，经 `from order_normalize import *` re-export。
-RECEIPT_STATUS_NEW = "new"
-RECEIPT_STATUS_CONFIRMED = "confirmed"
-RECEIPT_STATUS_FETCHED = "fetched"
-RECEIPT_STATUS_CANCELLED = "cancelled"
-RECEIPT_STATUS_ALL = "all"
-RECEIPT_API_STATUSES = {RECEIPT_STATUS_NEW, RECEIPT_STATUS_FETCHED, RECEIPT_STATUS_ALL}
-RECEIPT_STORAGE_STATUSES = {RECEIPT_STATUS_CONFIRMED, RECEIPT_STATUS_FETCHED, RECEIPT_STATUS_CANCELLED}
+# RECEIPT_STATUS_* / RECEIPT_API_STATUSES / RECEIPT_STORAGE_STATUSES 已移至 receipt_logic.py（门面 re-export）。
 
 BASE_ITEM_FIELDS = [
     "code",
@@ -1427,36 +1125,6 @@ def llm_order_draft_from_message(existing_draft: dict[str, Any], message: str) -
     return normalized
 
 
-def llm_parse_receipt_photo(image_bytes: bytes, mime_type: str | None, raw_ref: str) -> dict[str, Any]:
-    today = datetime.now().date().isoformat()
-    prompt = f"""
-你是产成品入库照片识别助手。请读取车间发来的产成品入库照片，只识别成品名称和数量清单。
-
-只输出一个 JSON 对象，不要解释，不要 Markdown。
-
-格式：
-{{
-  "date": "YYYY-MM-DD",
-  "items": [
-    {{"code": null, "name": "成品名称", "spec": null, "unit": "箱", "qty": 50}}
-  ]
-}}
-
-规则：
-- 今天日期：{today}
-- date 是车间入库日期。图片里有日期就按图片日期；没有日期就填今天。
-- 不要输出 store，入库是车间总量，不分门店。
-- items[].qty 必须是数字，不要带“箱/袋/件”等单位字。
-- 单位放到 unit；识别不到单位填 null。
-- code/spec 可选，识别不到填 null。
-- 不要编造图片里没有的成品。
-""".strip()
-    parsed = call_vision_json(vision_client, VISION_MODEL, prompt, image_bytes, mime_type)
-    parsed["raw_ref"] = raw_ref
-    parsed["created_at"] = now_iso()
-    return normalize_receipt_payload(parsed)
-
-
 def save_confirmed_order(user_id: str, draft: dict[str, Any]) -> tuple[int, int]:
     started_at = time.perf_counter()
     payload = normalize_order_payload(draft)
@@ -1940,7 +1608,7 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
 
 def handle_receipt_photo_input(user_id: str, image_bytes: bytes, mime_type: str | None, raw_ref: str) -> ChatResponse:
     try:
-        draft = llm_parse_receipt_photo(image_bytes, mime_type, raw_ref)
+        draft = llm_parse_receipt_photo(vision_client, VISION_MODEL, image_bytes, mime_type, raw_ref)
     except Exception as exc:
         logger.warning("receipt_photo_parse_failed user_id=%s raw_ref=%s error=%s", user_id, raw_ref, exc)
         if "vision model is not configured" in str(exc):
