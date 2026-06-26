@@ -49,6 +49,8 @@ import agent_router
 import models
 from order_normalize import *  # 订单归一化纯函数层（门面 re-export，调用点/测试可见性不变）
 from excel_import import *  # Excel 订单解析层（门面 re-export）
+from llm_json import *  # 大模型输出 JSON 提取通用 helper（门面 re-export）
+from vision_import import *  # 视觉/照片解析层（client/model 由 main 注入；门面 re-export）
 
 load_dotenv()
 
@@ -1180,23 +1182,6 @@ ORDER_CONTRACT_EXPORT_HEADERS = [
 # EXCEL_HEADER_ALIASES / EXCEL_METADATA_LABELS 已移至 excel_import.py（门面 re-export）。
 
 
-def extract_json_object(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("missing JSON object")
-
-    data = json.loads(text[start : end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("JSON root must be an object")
-    return data
-
-
 def normalize_command(message: str) -> str:
     return re.sub(r"\s+", "", message.strip()).lower()
 
@@ -1462,28 +1447,6 @@ def looks_like_receipt_business_message(message: str) -> bool:
     if "入库" in command and command_contains_any(command, {"产成品", "成品", "车间", "照片", "图片", "清单", "记录", "记一下"}):
         return True
     return command_contains_any(command, {"产成品", "成品"}) and command_contains_any(command, {"照片", "图片", "车间", "入库"})
-
-
-def safe_extract_json_object(text: str) -> dict[str, Any]:
-    raw = str(text or "").strip()
-    if not raw:
-        return {}
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return {}
-        try:
-            data = json.loads(raw[start : end + 1])
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
 
 
 def call_global_business_route_llm(messages: list[dict[str, str]]) -> str:
@@ -1769,86 +1732,6 @@ def llm_order_draft_from_message(existing_draft: dict[str, Any], message: str) -
     return normalized
 
 
-def image_data_uri(image_bytes: bytes, mime_type: str | None) -> str:
-    mime = mime_type or "image/jpeg"
-    if not mime.startswith("image/"):
-        mime = "image/jpeg"
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def ensure_vision_recognition_ready() -> None:
-    if vision_client is None:
-        raise RuntimeError("vision model is not configured")
-
-
-def call_vision_json(prompt: str, image_bytes: bytes, mime_type: str | None) -> dict[str, Any]:
-    ensure_vision_recognition_ready()
-    response = vision_client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {"role": "system", "content": "你只输出可解析 JSON。"},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_data_uri(image_bytes, mime_type)}},
-                ],
-            },
-        ],
-        temperature=0,
-    )
-    raw = response.choices[0].message.content or ""
-    return extract_json_object(raw)
-
-
-def llm_parse_photo_order(image_bytes: bytes, mime_type: str | None, raw_ref: str) -> dict[str, Any]:
-    today = datetime.now().date().isoformat()
-    current_year = datetime.now().year
-    prompt = f"""
-你是通用订单照片识别助手。请读取图片中的订单表格或手写订单，输出 Web 工具可直接使用的基础订单 JSON。
-
-只输出一个 JSON 对象，不要解释，不要 Markdown。
-
-格式：
-{{
-  "kind":"base",
-  "source":"photo",
-  "store":"门店/区域",
-  "order_no":"有则填，没有留空",
-  "orderer":"可空",
-  "order_date":"YYYY-MM-DD 或原文，可空",
-  "deliver_date":"YYYY-MM-DD 或原文，可空",
-  "items":[
-    {{"code":"商品编码或#N/A或空","name":"商品名称","spec":"规格","unit":"单位","qty":2,"price":267.32,"category":"分类"}}
-  ],
-  "confirmed":false,
-  "status":"new",
-  "raw_ref":"",
-  "created_at":""
-}}
-
-要求：
-- 今天日期：{today}，当前年份：{current_year}。
-- order_date 是订单标题/表头里的下单日期或归属日期，例如“6.16下午订单”“6.16订”必须按当前年份输出为“{current_year}-06-16”。
-- 表格中的送货/配送/到货日期只放 deliver_date，不要拿它替代 order_date。
-- qty 和 price 尽量输出数字，识别不到用 null。
-- code、spec、category 识别不到用空字符串。
-- deliver_date 只填客户要求送达/到货日期；created_at 不要填送达日期。
-- 不要编造图片里没有的信息。
-- 多个商品拆成多个 items。
-""".strip()
-
-    parsed = call_vision_json(prompt, image_bytes, mime_type)
-    parsed["kind"] = ORDER_KIND_BASE
-    parsed["source"] = ORDER_SOURCE_PHOTO
-    parsed["confirmed"] = False
-    parsed["status"] = ORDER_STATUS_NEW
-    parsed["raw_ref"] = raw_ref
-    parsed["created_at"] = now_iso()
-    return normalize_order_payload(parsed)
-
-
 def llm_parse_receipt_photo(image_bytes: bytes, mime_type: str | None, raw_ref: str) -> dict[str, Any]:
     today = datetime.now().date().isoformat()
     prompt = f"""
@@ -1873,7 +1756,7 @@ def llm_parse_receipt_photo(image_bytes: bytes, mime_type: str | None, raw_ref: 
 - code/spec 可选，识别不到填 null。
 - 不要编造图片里没有的成品。
 """.strip()
-    parsed = call_vision_json(prompt, image_bytes, mime_type)
+    parsed = call_vision_json(vision_client, VISION_MODEL, prompt, image_bytes, mime_type)
     parsed["raw_ref"] = raw_ref
     parsed["created_at"] = now_iso()
     return normalize_receipt_payload(parsed)
@@ -3371,7 +3254,7 @@ def handle_excel_order_input(user_id: str, file_bytes: bytes, raw_ref: str) -> C
 
 def handle_photo_order_input(user_id: str, image_bytes: bytes, mime_type: str | None, raw_ref: str) -> ChatResponse:
     try:
-        draft = llm_parse_photo_order(image_bytes, mime_type, raw_ref)
+        draft = llm_parse_photo_order(vision_client, VISION_MODEL, image_bytes, mime_type, raw_ref)
     except Exception as exc:
         logger.warning("photo_order_parse_failed user_id=%s raw_ref=%s error=%s", user_id, raw_ref, exc)
         if "vision model is not configured" in str(exc):
@@ -3816,7 +3699,7 @@ async def api_import_photo(
     reference = raw_ref or file.filename or "api:photo"
     mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0]
     try:
-        draft = llm_parse_photo_order(image_bytes, mime_type, reference)
+        draft = llm_parse_photo_order(vision_client, VISION_MODEL, image_bytes, mime_type, reference)
     except Exception as exc:
         logger.warning("api_photo_import_failed raw_ref=%s error=%s", reference, exc)
         if "vision model is not configured" in str(exc):
