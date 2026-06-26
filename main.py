@@ -47,11 +47,13 @@ from services.business_intent import (
 )
 import agent_router
 import models
+import store_sqlite  # 本地 SQLite 回退后端（双轨的 SQLite 这一轨；lock/db_file 由 main 注入）
 from order_normalize import *  # 订单归一化纯函数层（门面 re-export，调用点/测试可见性不变）
 from excel_import import *  # Excel 订单解析层（门面 re-export）
 from llm_json import *  # 大模型输出 JSON 提取通用 helper（门面 re-export）
 from vision_import import *  # 视觉/照片解析层（client/model 由 main 注入；门面 re-export）
 from order_export import *  # 订单 xlsx 导出层（records/export_dir 由 main 注入；门面 re-export）
+from store_sqlite import summarize_order_for_reply  # 撤回回复模板（models 分支格式化用；SQLite 分支在 store_sqlite 内自用）
 
 load_dotenv()
 
@@ -314,95 +316,6 @@ def save_session_state(state: dict[str, dict[str, Any]]) -> None:
     )
 
 
-def init_order_db() -> None:
-    ORDER_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(ORDER_DB_FILE) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS order_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                source TEXT NOT NULL,
-                store TEXT NOT NULL DEFAULT '',
-                order_date TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'new',
-                confirmed INTEGER NOT NULL DEFAULT 0,
-                raw_ref TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            )
-            """
-        )
-        columns = {
-            str(row[1])
-            for row in conn.execute("PRAGMA table_info(order_entries)").fetchall()
-        }
-        if "order_date" not in columns:
-            conn.execute("ALTER TABLE order_entries ADD COLUMN order_date TEXT NOT NULL DEFAULT ''")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_status ON order_entries(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_confirmed ON order_entries(confirmed)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_kind ON order_entries(kind)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_order_date ON order_entries(order_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_status_order_date ON order_entries(status, order_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_entries_raw_ref ON order_entries(raw_ref)")
-        rows = conn.execute(
-            "SELECT id, payload_json, created_at FROM order_entries WHERE order_date = ''"
-        ).fetchall()
-        for row in rows:
-            try:
-                payload = json.loads(str(row[1]))
-            except json.JSONDecodeError:
-                payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            order_date = normalize_order_date_text(payload.get("order_date")) if isinstance(payload, dict) else ""
-            if order_date:
-                conn.execute(
-                    "UPDATE order_entries SET order_date = ? WHERE id = ?",
-                    (str(order_date), int(row[0])),
-                )
-        conn.commit()
-
-
-def order_db_connection() -> sqlite3.Connection:
-    init_order_db()
-    conn = sqlite3.connect(ORDER_DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def row_to_order_payload(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        payload = json.loads(str(row["payload_json"]))
-    except json.JSONDecodeError:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-
-    payload["id"] = int(row["id"])
-    payload["kind"] = str(row["kind"])
-    payload["source"] = str(row["source"])
-    payload["store"] = str(row["store"] or payload.get("store") or "")
-    payload["confirmed"] = bool(row["confirmed"])
-    payload["status"] = str(row["status"])
-    payload["raw_ref"] = str(row["raw_ref"] or payload.get("raw_ref") or "")
-    payload["created_at"] = str(row["created_at"] or payload.get("created_at") or "")
-    payload["order_date"] = str(row["order_date"] or payload.get("order_date") or "")
-    normalized = normalize_order_payload(payload)
-    normalized["id"] = int(row["id"])
-    normalized["kind"] = str(row["kind"])
-    normalized["source"] = str(row["source"])
-    normalized["store"] = str(row["store"] or normalized.get("store") or "")
-    normalized["confirmed"] = bool(row["confirmed"])
-    normalized["status"] = str(row["status"])
-    normalized["raw_ref"] = str(row["raw_ref"] or normalized.get("raw_ref") or "")
-    normalized["created_at"] = str(row["created_at"] or normalized.get("created_at") or "")
-    normalized["order_date"] = str(row["order_date"] or normalized.get("order_date") or "")
-    return normalized
-
-
 def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_order_payload(payload)
     if normalized.get("confirmed"):
@@ -413,43 +326,7 @@ def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if models.is_enabled():
         return models.insert_order_payload(normalized)
 
-    created_at = normalized.get("created_at") or now_iso()
-    normalized["created_at"] = created_at
-    normalized["order_date"] = str(normalized.get("order_date") or "")
-    normalized["status"] = normalized.get("status") or "new"
-    normalized["confirmed"] = bool(normalized.get("confirmed"))
-
-    with ORDER_DB_LOCK:
-        with order_db_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO order_entries (
-                    kind, source, store, order_date, status, confirmed, raw_ref,
-                    created_at, updated_at, payload_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(normalized.get("kind") or ""),
-                    str(normalized.get("source") or ""),
-                    str(normalized.get("store") or ""),
-                    str(normalized.get("order_date") or ""),
-                    str(normalized.get("status") or "new"),
-                    1 if normalized.get("confirmed") else 0,
-                    str(normalized.get("raw_ref") or ""),
-                    created_at,
-                    now_iso(),
-                    json.dumps(normalized, ensure_ascii=False),
-                ),
-            )
-            order_id = int(cursor.lastrowid)
-            normalized["id"] = order_id
-            conn.execute(
-                "UPDATE order_entries SET payload_json = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(normalized, ensure_ascii=False), now_iso(), order_id),
-            )
-            conn.commit()
-    return normalized
+    return store_sqlite.insert_order_payload(normalized, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
 
 
 def query_order_payloads(
@@ -460,140 +337,28 @@ def query_order_payloads(
     if models.is_enabled():
         return models.query_order_payloads(status=status, ids=ids, order_date=order_date)
 
-    clauses = ["confirmed = 1", "status != ?"]
-    params: list[Any] = [ORDER_STATUS_CANCELLED]
-    if ids:
-        placeholders = ",".join("?" for _ in ids)
-        clauses.append(f"id IN ({placeholders})")
-        params.extend(ids)
-    else:
-        if order_date is not None:
-            clauses.append("order_date = ?")
-            params.append(order_date)
-    if status and status != ORDER_STATUS_ALL and not ids:
-        clauses.append("status = ?")
-        params.append(status)
-
-    where_sql = " AND ".join(clauses)
-    with order_db_connection() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM order_entries WHERE {where_sql} ORDER BY id ASC",
-            params,
-        ).fetchall()
-    return [row_to_order_payload(row) for row in rows]
+    return store_sqlite.query_order_payloads(
+        db_file=ORDER_DB_FILE, status=status, ids=ids, order_date=order_date
+    )
 
 
 def mark_order_payloads_fetched(ids: list[int]) -> dict[str, list[int]]:
     if models.is_enabled():
         return models.mark_order_payloads_fetched(ids)
 
-    clean_ids = sorted({int(order_id) for order_id in ids if int(order_id) > 0})
-    if not clean_ids:
-        return {"succeeded": [], "failed": []}
-
-    placeholders = ",".join("?" for _ in clean_ids)
-    with ORDER_DB_LOCK:
-        with order_db_connection() as conn:
-            existing_rows = conn.execute(
-                f"SELECT id FROM order_entries WHERE id IN ({placeholders}) AND status != ?",
-                [*clean_ids, ORDER_STATUS_CANCELLED],
-            ).fetchall()
-            existing_ids = {int(row["id"]) for row in existing_rows}
-            succeeded = [order_id for order_id in clean_ids if order_id in existing_ids]
-            failed = [order_id for order_id in clean_ids if order_id not in existing_ids]
-
-            if not succeeded:
-                return {"succeeded": [], "failed": failed}
-
-            update_placeholders = ",".join("?" for _ in succeeded)
-            conn.execute(
-                f"""
-                UPDATE order_entries
-                SET status = 'fetched',
-                    updated_at = ?
-                WHERE id IN ({update_placeholders})
-                """,
-                [now_iso(), *succeeded],
-            )
-            rows = conn.execute(
-                f"SELECT * FROM order_entries WHERE id IN ({update_placeholders})",
-                succeeded,
-            ).fetchall()
-            for row in rows:
-                payload = row_to_order_payload(row)
-                payload["status"] = "fetched"
-                conn.execute(
-                    "UPDATE order_entries SET payload_json = ? WHERE id = ?",
-                    (json.dumps(payload, ensure_ascii=False), int(row["id"])),
-                )
-            conn.commit()
-            return {"succeeded": succeeded, "failed": failed}
+    return store_sqlite.mark_order_payloads_fetched(ids, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
 
 
 def unmark_order_payloads(ids: list[int]) -> dict[str, list[int]]:
     if models.is_enabled():
         return models.unmark_order_payloads(ids)
 
-    clean_ids = sorted({int(order_id) for order_id in ids if int(order_id) > 0})
-    if not clean_ids:
-        return {"succeeded": [], "failed": []}
-
-    placeholders = ",".join("?" for _ in clean_ids)
-    with ORDER_DB_LOCK:
-        with order_db_connection() as conn:
-            existing_rows = conn.execute(
-                f"SELECT id FROM order_entries WHERE id IN ({placeholders}) AND status != ?",
-                [*clean_ids, ORDER_STATUS_CANCELLED],
-            ).fetchall()
-            existing_ids = {int(row["id"]) for row in existing_rows}
-            succeeded = [order_id for order_id in clean_ids if order_id in existing_ids]
-            failed = [order_id for order_id in clean_ids if order_id not in existing_ids]
-
-            if not succeeded:
-                return {"succeeded": [], "failed": failed}
-
-            update_placeholders = ",".join("?" for _ in succeeded)
-            conn.execute(
-                f"""
-                UPDATE order_entries
-                SET status = 'new',
-                    updated_at = ?
-                WHERE id IN ({update_placeholders})
-                """,
-                [now_iso(), *succeeded],
-            )
-            rows = conn.execute(
-                f"SELECT * FROM order_entries WHERE id IN ({update_placeholders})",
-                succeeded,
-            ).fetchall()
-            for row in rows:
-                payload = row_to_order_payload(row)
-                payload["status"] = ORDER_STATUS_NEW
-                conn.execute(
-                    "UPDATE order_entries SET payload_json = ? WHERE id = ?",
-                    (json.dumps(payload, ensure_ascii=False), int(row["id"])),
-                )
-            conn.commit()
-            return {"succeeded": succeeded, "failed": failed}
+    return store_sqlite.unmark_order_payloads(ids, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
 
 
 def raw_ref_belongs_to_user(raw_ref: str, user_id: str) -> bool:
     raw_ref = str(raw_ref or "")
     return raw_ref == user_id or raw_ref.startswith(f"{user_id}:")
-
-
-def summarize_order_for_reply(payload: dict[str, Any]) -> str:
-    store = str(payload.get("store") or "未填门店")
-    items = payload.get("items") if isinstance(payload.get("items"), list) else []
-    if not items:
-        return store
-    first = items[0] if isinstance(items[0], dict) else {}
-    name = str(first.get("name") or "未填商品")
-    qty = first.get("qty")
-    unit = str(first.get("unit") or "")
-    qty_text = "" if qty is None else f"{qty}{unit}"
-    more = "" if len(items) == 1 else f"等{len(items)}项"
-    return f"{store} {name}{qty_text}{more}".strip()
 
 
 def cancel_latest_order_for_user(user_id: str) -> str:
@@ -606,45 +371,7 @@ def cancel_latest_order_for_user(user_id: str) -> str:
         payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
         return f"好，刚那单（{summarize_order_for_reply(payload)}）撤回了，重新发我吧。"
 
-    with ORDER_DB_LOCK:
-        with order_db_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM order_entries
-                WHERE confirmed = 1
-                  AND status != ?
-                  AND (raw_ref = ? OR raw_ref LIKE ?)
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (ORDER_STATUS_CANCELLED, user_id, f"{user_id}:%"),
-            ).fetchall()
-            if not rows:
-                return "没找到你最近确认的订单，暂时没有可撤回的。"
-
-            row = rows[0]
-            payload = row_to_order_payload(row)
-            status = str(row["status"] or payload.get("status") or "")
-            if status == ORDER_STATUS_FETCHED:
-                return "这单已被排产/发货使用，不能直接撤回，需要联系数据部处理。"
-
-            payload["status"] = ORDER_STATUS_CANCELLED
-            payload["cancelled_at"] = now_iso()
-            conn.execute(
-                """
-                UPDATE order_entries
-                SET status = ?, payload_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    ORDER_STATUS_CANCELLED,
-                    json.dumps(payload, ensure_ascii=False),
-                    now_iso(),
-                    int(row["id"]),
-                ),
-            )
-            conn.commit()
-            return f"好，刚那单（{summarize_order_for_reply(payload)}）撤回了，重新发我吧。"
+    return store_sqlite.cancel_latest_order_for_user(user_id, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
 
 
 def summarize_receipt_for_reply(payload: dict[str, Any]) -> str:
