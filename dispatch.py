@@ -24,6 +24,8 @@ from fastapi import HTTPException
 import agent_router
 from main import (
     BUSINESS_NEGATION_KEYWORDS,
+    CHAT_SKILL_FILE,
+    HELP_SKILL_FILE,
     BusinessIntent,
     CUSTOMER_CHAT_PROMPT,
     ChatResponse,
@@ -175,6 +177,49 @@ def call_business_intent_llm(messages: list[dict[str, str]]) -> str:
         messages=messages,
     )
     return (response.choices[0].message.content or "").strip()
+
+_DEFAULT_CHAT_SKILL = "你是微信公司客服。根据给你的【场景/事实】用自然、简短的人话回复客户，只能依据事实说话，严禁编造功能/数据/单号；涉及价格、交期、投诉、发票、退款等转人工，不要声称自己在入库/同步/保存。"
+_DEFAULT_HELP_SKILL = "根据给你的【真实功能清单】用自然的话介绍给客户，严禁新增、暗示清单里没有的功能或命令。"
+
+
+def load_chat_skill() -> str:
+    """读取客服话术 skill（闲聊/引导/解释/错误引导共用）。每次读取，改了 .md 立即生效。"""
+    try:
+        text = CHAT_SKILL_FILE.read_text(encoding="utf-8").strip()
+        return text or _DEFAULT_CHAT_SKILL
+    except OSError as exc:
+        logger.warning("chat_skill_load_failed file=%s error=%s", CHAT_SKILL_FILE, exc)
+        return _DEFAULT_CHAT_SKILL
+
+
+def load_help_skill() -> str:
+    """读取功能介绍 skill（措辞由 LLM、功能清单由代码注入）。每次读取，改了 .md 立即生效。"""
+    try:
+        text = HELP_SKILL_FILE.read_text(encoding="utf-8").strip()
+        return text or _DEFAULT_HELP_SKILL
+    except OSError as exc:
+        logger.warning("help_skill_load_failed file=%s error=%s", HELP_SKILL_FILE, exc)
+        return _DEFAULT_HELP_SKILL
+
+
+def llm_reply(skill: str, context: str, *, fallback: str = "") -> str:
+    """统一"措辞"通道：skill(给 LLM 的指令) + context(代码给的真事实/用户消息) → LLM 组织成人话。
+
+    走 call_business_intent_llm 通道。仅用于"不碰精确数据"或"精确数据由代码注入、LLM 只措辞"的回复；
+    草稿回显 / 危险动作反馈 / 含精确数据(ID/数量/URL)的确认 一律不走这里（保持模板）。
+    LLM 失败或空回复时返回 fallback（调用方给的安全确定性短句），保证不空。
+    """
+    try:
+        reply = call_business_intent_llm(
+            [
+                {"role": "system", "content": skill},
+                {"role": "user", "content": context},
+            ]
+        ).strip()
+    except Exception as exc:
+        logger.warning("llm_reply_failed error=%s", exc)
+        return fallback
+    return reply or fallback
 
 def classify_order_reply_intent(message: str, draft: dict[str, Any]) -> BusinessIntent:
     return classify_business_intent(
@@ -1078,6 +1123,9 @@ __all__ = [
     "append_mode_hint",
     "strip_order_inline_prefix",
     "call_business_intent_llm",
+    "load_chat_skill",
+    "load_help_skill",
+    "llm_reply",
     "classify_order_reply_intent",
     "business_confirm_clarification",
     "order_draft_reply",

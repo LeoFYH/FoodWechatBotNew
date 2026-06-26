@@ -42,6 +42,27 @@ class RoutingStateTests(unittest.TestCase):
     def stub_chat(self):
         return patch.object(self.dispatch, "call_customer_chat_llm", return_value="普通回复")
 
+    def test_llm_reply_passes_skill_and_context_via_intent_channel(self) -> None:
+        # 阶段6 基建：llm_reply 把 skill 当 system、context 当 user，走 call_business_intent_llm 通道。
+        captured = {}
+
+        def fake(messages):
+            captured["messages"] = messages
+            return "  自然措辞回复  "
+
+        with patch.object(self.dispatch, "call_business_intent_llm", side_effect=fake):
+            out = self.dispatch.llm_reply("这是技能指令", "这是代码给的真实事实")
+
+        self.assertEqual(out, "自然措辞回复")
+        self.assertEqual(captured["messages"][0], {"role": "system", "content": "这是技能指令"})
+        self.assertEqual(captured["messages"][1], {"role": "user", "content": "这是代码给的真实事实"})
+
+    def test_llm_reply_returns_fallback_on_failure(self) -> None:
+        # LLM 失败时返回调用方给的安全确定性短句，绝不空、绝不抛。
+        with patch.object(self.dispatch, "call_business_intent_llm", side_effect=RuntimeError("boom")):
+            out = self.dispatch.llm_reply("s", "c", fallback="我在，稍等。")
+        self.assertEqual(out, "我在，稍等。")
+
     def test_question_with_confirm_word_transfers_to_human(self) -> None:
         response = self.main.handle_user_message("u1", "发票可以开吗")
         self.assertIn("转人工", response.answer)

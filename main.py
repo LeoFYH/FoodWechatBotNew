@@ -849,6 +849,12 @@ def collect_order_records() -> list[dict[str, str]]:
 RECEIPT_SKILL_FILE = Path(
     os.getenv("RECEIPT_SKILL_FILE", str(Path(__file__).resolve().parent / "skills" / "receipt" / "SKILL.md"))
 )
+CHAT_SKILL_FILE = Path(
+    os.getenv("CHAT_SKILL_FILE", str(Path(__file__).resolve().parent / "skills" / "chat" / "SKILL.md"))
+)
+HELP_SKILL_FILE = Path(
+    os.getenv("HELP_SKILL_FILE", str(Path(__file__).resolve().parent / "skills" / "help" / "SKILL.md"))
+)
 
 
 def get_wecom_crypto() -> WXBizMsgCrypt:
