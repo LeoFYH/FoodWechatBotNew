@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
+import excel_import  # Excel 解析已搬到 excel_import；patch 目标须指向本模块（find_excel_header_row 内部按此命名空间调用 score）
+
 
 class FakeCell:
     def __init__(self, row: int, column: int, value):
@@ -210,7 +212,7 @@ class ExcelParsingTests(unittest.TestCase):
             ],
         ]
 
-        with patch.object(self.main, "score_excel_header_candidate", wraps=self.main.score_excel_header_candidate) as scorer:
+        with patch.object(excel_import, "score_excel_header_candidate", wraps=excel_import.score_excel_header_candidate) as scorer:
             header_index, header_map = self.main.find_excel_header_row(rows)
 
         self.assertEqual(header_index, 2)
@@ -228,7 +230,7 @@ class ExcelParsingTests(unittest.TestCase):
             ],
         ]
 
-        with patch.object(self.main, "score_excel_header_candidate", wraps=self.main.score_excel_header_candidate) as scorer:
+        with patch.object(excel_import, "score_excel_header_candidate", wraps=excel_import.score_excel_header_candidate) as scorer:
             with self.assertRaisesRegex(ValueError, "no order item rows"):
                 self.main.find_excel_header_row(rows)
 
