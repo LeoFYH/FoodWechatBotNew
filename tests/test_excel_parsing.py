@@ -63,10 +63,12 @@ class ExcelParsingTests(unittest.TestCase):
         self.env_patch.start()
         os.environ.pop("VISION_API_KEY", None)
         sys.modules.pop("main", None)
+        sys.modules.pop("dispatch", None)  # dispatch 引用 main 状态，重载须一起 pop 以重绑到新 main
         self.main = importlib.import_module("main")
 
     def tearDown(self) -> None:
         sys.modules.pop("main", None)
+        sys.modules.pop("dispatch", None)
         self.env_patch.stop()
         self.tempdir.cleanup()
 

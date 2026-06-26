@@ -29,15 +29,18 @@ class RoutingStateTests(unittest.TestCase):
         self.env_patch.start()
         os.environ.pop("VISION_API_KEY", None)
         sys.modules.pop("main", None)
+        sys.modules.pop("dispatch", None)  # dispatch 引用 main 状态，重载须一起 pop 以重绑到新 main
         self.main = importlib.import_module("main")
+        self.dispatch = importlib.import_module("dispatch")  # 分发逻辑已搬到 dispatch；patch 目标指向此处
 
     def tearDown(self) -> None:
         sys.modules.pop("main", None)
+        sys.modules.pop("dispatch", None)
         self.env_patch.stop()
         self.tempdir.cleanup()
 
     def stub_chat(self):
-        return patch.object(self.main, "call_customer_chat_llm", return_value="普通回复")
+        return patch.object(self.dispatch, "call_customer_chat_llm", return_value="普通回复")
 
     def test_question_with_confirm_word_transfers_to_human(self) -> None:
         response = self.main.handle_user_message("u1", "发票可以开吗")
@@ -57,7 +60,7 @@ class RoutingStateTests(unittest.TestCase):
 
     def test_plain_order_text_routes_to_order_parser(self) -> None:
         expected = self.main.ChatResponse(user_id="u1", answer="订单解析", history_length=0)
-        with patch.object(self.main, "handle_order_user_message", return_value=expected) as handler:
+        with patch.object(self.dispatch, "handle_order_user_message", return_value=expected) as handler:
             response = self.main.handle_user_message("u1", "老三家 鸡腿 20件")
         handler.assert_called_once()
         self.assertEqual(response.answer, "订单解析")
@@ -74,7 +77,7 @@ class RoutingStateTests(unittest.TestCase):
 
     def test_llm_global_route_can_enter_order_mode(self) -> None:
         with patch.object(
-            self.main,
+            self.dispatch,
             "call_global_business_route_llm",
             return_value='{"route":"enter_order","confidence":0.91,"reason":"要录订单"}',
         ):
@@ -151,7 +154,7 @@ class RoutingStateTests(unittest.TestCase):
                 ],
             }
         )
-        with patch.object(self.main, "llm_receipt_draft_from_message", return_value=updated) as skill:
+        with patch.object(self.dispatch, "llm_receipt_draft_from_message", return_value=updated) as skill:
             response = self.main.handle_user_message("u1", "鲜肉馄饨改成20件")
         skill.assert_called_once()
         draft = self.main.get_receipt_draft("u1")
@@ -182,7 +185,7 @@ class RoutingStateTests(unittest.TestCase):
                 ],
             }
         )
-        with patch.object(self.main, "llm_order_draft_from_message", return_value=updated) as skill:
+        with patch.object(self.dispatch, "llm_order_draft_from_message", return_value=updated) as skill:
             response = self.main.handle_user_message("u1", "鸡腿改成30件 再加鸭腿8件")
         skill.assert_called_once()
         draft = self.main.get_order_draft("u1")
@@ -202,7 +205,7 @@ class RoutingStateTests(unittest.TestCase):
                 "change_type": "add",
             },
         )
-        with patch.object(self.main, "llm_order_draft_from_message", return_value=None):
+        with patch.object(self.dispatch, "llm_order_draft_from_message", return_value=None):
             response = self.main.handle_user_message("u1", "鸡腿改成30件")
         draft = self.main.get_order_draft("u1")
         self.assertIn("没解析成功", response.answer)
@@ -221,7 +224,7 @@ class RoutingStateTests(unittest.TestCase):
         )
 
         with patch.object(
-            self.main,
+            self.dispatch,
             "call_business_intent_llm",
             return_value='{"intent":"confirm","confidence":0.96,"reason":"用户说没事了"}',
         ):
@@ -246,7 +249,7 @@ class RoutingStateTests(unittest.TestCase):
                 "change_type": "add",
             },
         )
-        with patch.object(self.main, "call_business_intent_llm", side_effect=AssertionError("LLM should not be called")):
+        with patch.object(self.dispatch, "call_business_intent_llm", side_effect=AssertionError("LLM should not be called")):
             response = self.main.handle_user_message("u1", "我先看看这单有啥")
 
         self.assertIn("当前订单草稿", response.answer)
@@ -267,7 +270,7 @@ class RoutingStateTests(unittest.TestCase):
                 "change_type": "add",
             },
         )
-        with patch.object(self.main, "call_business_intent_llm", side_effect=AssertionError("LLM should not be called")):
+        with patch.object(self.dispatch, "call_business_intent_llm", side_effect=AssertionError("LLM should not be called")):
             response = self.main.handle_user_message("u1", "查看当前订单")
 
         self.assertIn("当前订单草稿", response.answer)
@@ -285,7 +288,7 @@ class RoutingStateTests(unittest.TestCase):
                 "change_type": "add",
             },
         )
-        with patch.object(self.main, "call_business_intent_llm", side_effect=AssertionError("LLM should not be called")):
+        with patch.object(self.dispatch, "call_business_intent_llm", side_effect=AssertionError("LLM should not be called")):
             response = self.main.handle_user_message("u1", "重复一遍订单")
 
         self.assertIn("当前订单草稿", response.answer)
@@ -298,7 +301,7 @@ class RoutingStateTests(unittest.TestCase):
             "u1",
             {"date": "2026-06-24", "items": [{"name": "鲜肉馄饨", "qty": 10, "unit": "箱"}]},
         )
-        with patch.object(self.main, "llm_receipt_draft_from_message", return_value=None):
+        with patch.object(self.dispatch, "llm_receipt_draft_from_message", return_value=None):
             response = self.main.handle_user_message("u1", "鲜肉馄饨改成20件")
         draft = self.main.get_receipt_draft("u1")
         self.assertIn("没解析成功", response.answer)
