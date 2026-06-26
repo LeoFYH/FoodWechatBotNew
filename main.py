@@ -56,6 +56,7 @@ from order_export import *  # 订单 xlsx 导出层（records/export_dir 由 mai
 from store_sqlite import summarize_order_for_reply  # 撤回回复模板（models 分支格式化用；SQLite 分支在 store_sqlite 内自用）
 from receipt_logic import *  # 入库(receipt)领域：RECEIPT 常量 + 归一化/missing/summarize/status helper（门面 re-export）
 from commands import *  # 命令分类规则（确定性，无 LLM）：危险动作硬判 + 命令词表（门面 re-export）
+from wecom import *  # 企业微信加解密 + 协议解析（无状态；token/aes_key/corp_id 由 main 注入；门面 re-export）
 
 load_dotenv()
 
@@ -208,21 +209,7 @@ class DeleteMemoryResponse(BaseModel):
     user_id: str
 
 
-class WecomMessage(BaseModel):
-    msg_type: str
-    chat_type: str
-    chat_id: str
-    msg_id: str
-    sender_user_id: str
-    sender_name: str
-    content: str
-
-
-class WecomKfEvent(BaseModel):
-    token: str
-    open_kfid: str
-    event: str
-    create_time: str
+# WecomMessage / WecomKfEvent 已移至 wecom.py（门面 re-export）。
 
 
 class WecomKfApiError(RuntimeError):
@@ -1728,80 +1715,11 @@ def require_query_param(request: Request, name: str) -> str:
     return value
 
 
-def xml_text(parent: ET.Element, path: str, default: str = "") -> str:
-    node = parent.find(path)
-    if node is None or node.text is None:
-        return default
-    return node.text
-
-
-def parse_wecom_plain_message(plain_xml: bytes | str) -> WecomMessage:
-    if isinstance(plain_xml, bytes):
-        plain_xml = plain_xml.decode("utf-8")
-
-    root = ET.fromstring(plain_xml)
-    msg_type = xml_text(root, "MsgType")
-    chat_type = xml_text(root, "ChatType")
-    chat_id = xml_text(root, "ChatId")
-    msg_id = xml_text(root, "MsgId")
-    sender_user_id = xml_text(root, "From/UserId")
-    sender_name = xml_text(root, "From/Name") or xml_text(root, "From/Alias") or sender_user_id
-
-    if msg_type == "text":
-        content = xml_text(root, "Text/Content")
-    elif msg_type == "mixed":
-        parts: list[str] = []
-        mixed = root.find("MixedMessage")
-        if mixed is not None:
-            for item in mixed:
-                if xml_text(item, "MsgType") == "text":
-                    parts.append(xml_text(item, "Text/Content"))
-        content = "\n".join(part for part in parts if part).strip()
-    elif msg_type == "event":
-        event_type = xml_text(root, "Event/EventType")
-        content = f"[event:{event_type}]"
-    else:
-        content = ""
-
-    return WecomMessage(
-        msg_type=msg_type,
-        chat_type=chat_type,
-        chat_id=chat_id,
-        msg_id=msg_id,
-        sender_user_id=sender_user_id,
-        sender_name=sender_name,
-        content=content,
-    )
-
-
 def strip_bot_mention(content: str) -> str:
     content = content.strip()
     if WECOM_BOT_NAME:
         content = content.replace(f"@{WECOM_BOT_NAME}", "").strip()
     return content
-
-
-def build_wecom_text_response_xml(content: str) -> bytes:
-    root = ET.Element("xml")
-    ET.SubElement(root, "MsgType").text = "text"
-    text = ET.SubElement(root, "Text")
-    ET.SubElement(text, "Content").text = content
-    return ET.tostring(root, encoding="utf-8", method="xml")
-
-
-def encrypt_wecom_response(content: str, nonce: str, timestamp: str) -> str:
-    ret, encrypted_response = get_wecom_crypto().EncryptMsg(
-        build_wecom_text_response_xml(content),
-        nonce,
-        timestamp,
-    )
-    if ret != 0:
-        logger.warning("wecom_encrypt_failed ret=%s", ret)
-        raise HTTPException(status_code=500, detail=f"WeCom encrypt failed: {ret}")
-
-    if isinstance(encrypted_response, bytes):
-        return encrypted_response.decode("utf-8")
-    return encrypted_response
 
 
 def is_duplicate_wecom_message(msg_id: str) -> bool:
@@ -1854,117 +1772,6 @@ def get_wecom_kf_crypto() -> WXBizMsgCrypt:
         WECOM_KF_ENCODING_AES_KEY,
         WECOM_KF_CORP_ID,
         channel=WxChannel_Wecom,
-    )
-
-
-def compute_wecom_signature(token: str, timestamp: str, nonce: str, encrypted: str) -> str:
-    raw = "".join(sorted([token, timestamp, nonce, encrypted]))
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def decrypt_wecom_kf_payload(encrypted: str) -> tuple[bytes, str]:
-    if not WECOM_KF_ENCODING_AES_KEY:
-        raise HTTPException(status_code=500, detail="WECOM_KF_ENCODING_AES_KEY must be configured")
-
-    try:
-        key = base64.b64decode(WECOM_KF_ENCODING_AES_KEY + "=")
-        if len(key) != 32:
-            raise ValueError("invalid key length")
-        cryptor = AES.new(key, AES.MODE_CBC, key[:16])
-        plain_text = cryptor.decrypt(base64.b64decode(encrypted))
-        pad = plain_text[-1]
-        if pad < 1 or pad > 32:
-            raise ValueError("invalid padding")
-
-        content = plain_text[16:-pad]
-        if len(content) < 4:
-            raise ValueError("missing message length")
-        xml_len = socket.ntohl(struct.unpack("I", content[:4])[0])
-        xml_content = content[4 : xml_len + 4]
-        receive_id = content[xml_len + 4 :].decode("utf-8", errors="replace")
-        return xml_content, receive_id
-    except Exception as exc:
-        logger.warning("wecom_kf_decrypt_payload_failed error=%s", exc)
-        raise HTTPException(status_code=403, detail="WeCom KF decrypt failed") from exc
-
-
-def verify_wecom_kf_signature(msg_signature: str, timestamp: str, nonce: str, encrypted: str) -> None:
-    if not WECOM_KF_CALLBACK_TOKEN:
-        raise HTTPException(status_code=500, detail="WECOM_KF_CALLBACK_TOKEN must be configured")
-
-    expected_signature = compute_wecom_signature(
-        WECOM_KF_CALLBACK_TOKEN,
-        timestamp,
-        nonce,
-        encrypted,
-    )
-    if not hmac.compare_digest(expected_signature, msg_signature):
-        logger.warning(
-            "wecom_kf_signature_failed expected=%s actual=%s",
-            expected_signature,
-            msg_signature,
-        )
-        raise HTTPException(status_code=403, detail="WeCom KF signature failed")
-
-
-def decrypt_wecom_kf_verify_url(
-    msg_signature: str,
-    timestamp: str,
-    nonce: str,
-    echostr: str,
-) -> str:
-    verify_wecom_kf_signature(msg_signature, timestamp, nonce, echostr)
-    decrypted_echo, receive_id = decrypt_wecom_kf_payload(echostr)
-    if WECOM_KF_CORP_ID and receive_id != WECOM_KF_CORP_ID:
-        logger.warning(
-            "wecom_kf_receive_id_mismatch expected=%s actual=%s",
-            WECOM_KF_CORP_ID,
-            receive_id,
-        )
-    return decrypted_echo.decode("utf-8")
-
-
-def decrypt_wecom_kf_message(
-    encrypted_body: bytes,
-    msg_signature: str,
-    timestamp: str,
-    nonce: str,
-) -> bytes:
-    try:
-        encrypted = xml_text(ET.fromstring(encrypted_body), "Encrypt")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid WeCom KF encrypted XML") from exc
-
-    if not encrypted:
-        raise HTTPException(status_code=400, detail="Missing WeCom KF Encrypt field")
-
-    verify_wecom_kf_signature(msg_signature, timestamp, nonce, encrypted)
-    plain_xml, receive_id = decrypt_wecom_kf_payload(encrypted)
-    if WECOM_KF_CORP_ID and receive_id != WECOM_KF_CORP_ID:
-        logger.warning(
-            "wecom_kf_receive_id_mismatch expected=%s actual=%s",
-            WECOM_KF_CORP_ID,
-            receive_id,
-        )
-    return plain_xml
-
-
-def parse_wecom_kf_event(plain_xml: bytes | str) -> WecomKfEvent:
-    if isinstance(plain_xml, bytes):
-        plain_xml = plain_xml.decode("utf-8")
-
-    root = ET.fromstring(plain_xml)
-    msg_type = xml_text(root, "MsgType")
-    event = xml_text(root, "Event")
-
-    if msg_type != "event" or event != "kf_msg_or_event":
-        raise ValueError(f"Unsupported WeCom KF callback: MsgType={msg_type}, Event={event}")
-
-    return WecomKfEvent(
-        token=xml_text(root, "Token"),
-        open_kfid=xml_text(root, "OpenKfId"),
-        event=event,
-        create_time=xml_text(root, "CreateTime"),
     )
 
 
@@ -2568,7 +2375,7 @@ async def wecom_callback(request: Request):
             logger.warning("wecom_answer_failed msg_id=%s error=%s", message.msg_id, exc)
             answer = "这条消息处理失败了，请稍后再试。"
 
-    encrypted_response = encrypt_wecom_response(answer, nonce, timestamp)
+    encrypted_response = encrypt_wecom_response(get_wecom_crypto(), answer, nonce, timestamp)
     return PlainTextResponse(encrypted_response, media_type="application/xml")
 
 
@@ -2589,6 +2396,9 @@ async def wecom_kf_verify(request: Request):
         timestamp,
         nonce,
         echostr,
+        token=WECOM_KF_CALLBACK_TOKEN,
+        aes_key=WECOM_KF_ENCODING_AES_KEY,
+        corp_id=WECOM_KF_CORP_ID,
     )
 
     return PlainTextResponse(decrypted_echo)
@@ -2612,6 +2422,9 @@ async def wecom_kf_callback(request: Request, background_tasks: BackgroundTasks)
         msg_signature,
         timestamp,
         nonce,
+        token=WECOM_KF_CALLBACK_TOKEN,
+        aes_key=WECOM_KF_ENCODING_AES_KEY,
+        corp_id=WECOM_KF_CORP_ID,
     )
 
     try:
