@@ -249,17 +249,59 @@ class RoutingStateTests(unittest.TestCase):
             },
         )
 
+        # "没事了"被规则判为 CHAT → 走闲聊（stub）+ 草稿提醒；即便 LLM 想 confirm 也绝不保存。
         with patch.object(
             self.dispatch,
             "call_business_intent_llm",
             return_value='{"intent":"confirm","confidence":0.96,"reason":"用户说没事了"}',
-        ):
+        ), patch.object(self.dispatch, "call_customer_chat_llm", return_value="嗯，好的。"):
             response = self.main.handle_user_message("u1", "没事了")
 
         self.assertNotIn("已保存订单入库", response.answer)
-        self.assertIn("确认", response.answer)
+        self.assertIn("确认", response.answer)  # 草稿提醒里有"确认请回'确认'"
         self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
         self.assertEqual(self.main.user_order_count("u1"), 0)
+
+    # ---- 草稿态"逃逸"：状态/help/拒绝/闲聊 都能被正确处理，且草稿绝不丢（铁律 b）----
+
+    _ORDER_DRAFT_FIXTURE = {
+        "kind": "patch",
+        "source": "text",
+        "store": "老三家",
+        "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+        "change_type": "add",
+    }
+    _RECEIPT_DRAFT_FIXTURE = {"date": "2026-06-24", "items": [{"name": "鲜肉馄饨", "qty": 10, "unit": "箱"}]}
+
+    def test_draft_state_status_query_keeps_draft(self) -> None:
+        self.main.save_order_draft("u1", dict(self._ORDER_DRAFT_FIXTURE))
+        response = self.main.handle_user_message("u1", "我在啥模式来着")
+        self.assertIn("待确认", response.answer)  # build_status_message 报当前状态（有草稿待确认）
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
+
+    def test_draft_state_help_query_keeps_draft(self) -> None:
+        self.main.save_order_draft("u1", dict(self._ORDER_DRAFT_FIXTURE))
+        response = self.main.handle_user_message("u1", "你有啥功能")
+        self.assertIn("模式", response.answer)  # build_mode_help_message 介绍模式
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
+
+    def test_draft_state_reject_keeps_receipt_draft(self) -> None:
+        self.main.save_receipt_draft("u1", dict(self._RECEIPT_DRAFT_FIXTURE))
+        response = self.main.handle_user_message("u1", "先不入库")
+        self.assertIn("先不保存", response.answer)  # 拒绝走 REJECT 分支
+        self.assertTrue(self.main.receipt_draft_has_content(self.main.get_receipt_draft("u1")))  # 草稿仍在
+
+    def test_draft_state_chat_keeps_draft_and_reminds(self) -> None:
+        self.main.save_order_draft("u1", dict(self._ORDER_DRAFT_FIXTURE))
+        with patch.object(
+            self.dispatch,
+            "call_business_intent_llm",
+            return_value='{"intent":"chat","confidence":0.95,"reason":"闲聊"}',
+        ), patch.object(self.dispatch, "call_customer_chat_llm", return_value="今天挺好。"):
+            response = self.main.handle_user_message("u1", "今天天气不错啊")
+        self.assertIn("今天挺好", response.answer)  # 闲聊一句
+        self.assertIn("那单还在", response.answer)  # 草稿提醒
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
 
     def test_order_draft_view_command_shows_current_draft_without_llm(self) -> None:
         self.main.save_order_draft(

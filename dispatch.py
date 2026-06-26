@@ -491,7 +491,15 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 answer=answer,
                 history_length=history_length,
             )
-        if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT} and not looks_like_order_message(message):
+        if intent.intent == INTENT_CHAT and not looks_like_order_message(message):
+            # 草稿态闲聊：闲聊一句 + 提醒草稿还在。全程只读，绝不清草稿/切模式。
+            chat = handle_general_chat(user_id, message)
+            return ChatResponse(
+                user_id=user_id,
+                answer=chat.answer + "\n（你那单还在，确认请回“确认”，要改直接发修改内容。）",
+                history_length=chat.history_length,
+            )
+        if intent.intent == INTENT_UNCLEAR and not looks_like_order_message(message):
             return ChatResponse(
                 user_id=user_id,
                 answer=business_confirm_clarification(),
@@ -692,7 +700,15 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
             missing = receipt_missing_fields(updated_draft)
             answer = receipt_draft_reply("已按你的修改更新入库草稿：", updated_draft, missing)
             return ChatResponse(user_id=user_id, answer=answer, history_length=0)
-        if intent.intent in {INTENT_UNCLEAR, INTENT_CHAT}:
+        if intent.intent == INTENT_CHAT:
+            # 草稿态闲聊：闲聊一句 + 提醒入库草稿还在。全程只读，绝不清草稿/切模式。
+            chat = handle_general_chat(user_id, message)
+            return ChatResponse(
+                user_id=user_id,
+                answer=chat.answer + "\n（那条入库记录还在，确认请回“确认”，要改直接发修改内容。）",
+                history_length=chat.history_length,
+            )
+        if intent.intent == INTENT_UNCLEAR:
             return ChatResponse(
                 user_id=user_id,
                 answer=business_confirm_clarification(receipt=True),

@@ -123,7 +123,10 @@ def is_receipt_revoke_target(command: str) -> bool:
 
 
 def is_status_command(command: str) -> bool:
-    return command in STATUS_COMMANDS
+    if command in STATUS_COMMANDS:
+        return True
+    # 自然语言变体：问"我在啥模式来着""现在啥模式""哪个模式"等（只问当前模式，不含进入/退出意图）
+    return "模式" in command and command_contains_any(command, {"我在", "哪个", "哪种", "什么", "啥", "现在", "当前"})
 
 
 def is_business_query_or_negated(command: str) -> bool:
@@ -155,7 +158,13 @@ def is_receipt_mode_command(command: str) -> bool:
 def is_mode_help_command(command: str) -> bool:
     if command in MODE_HELP_COMMANDS:
         return True
-    return "模式" in command and command_contains_any(command, {"哪些", "什么", "有啥", "怎么", "功能"})
+    if "模式" in command and command_contains_any(command, {"哪些", "什么", "有啥", "怎么", "功能"}):
+        return True
+    # 自然语言变体：问"你有啥功能""能干啥""会啥""有什么用"等
+    return command_contains_any(
+        command,
+        {"有啥功能", "啥功能", "什么功能", "有什么功能", "能干啥", "能干什么", "能做啥", "能做什么", "会干啥", "会做啥", "会啥", "有什么用"},
+    )
 
 
 def is_question_like_command(command: str) -> bool:
