@@ -60,7 +60,12 @@ class RoutingStateTests(unittest.TestCase):
 
     def test_plain_order_text_routes_to_order_parser(self) -> None:
         expected = self.main.ChatResponse(user_id="u1", answer="订单解析", history_length=0)
-        with patch.object(self.dispatch, "handle_order_user_message", return_value=expected) as handler:
+        # 不再有 looks_like 关键词硬判：订单文字一律进 agent_router 分诊，这里 stub 路由大脑判为 order_text。
+        with patch.object(
+            self.dispatch,
+            "call_global_business_route_llm",
+            return_value='{"route":"order_text","confidence":0.9,"reason":"店+品+量"}',
+        ), patch.object(self.dispatch, "handle_order_user_message", return_value=expected) as handler:
             response = self.main.handle_user_message("u1", "老三家 鸡腿 20件")
         handler.assert_called_once()
         self.assertEqual(response.answer, "订单解析")

@@ -93,7 +93,6 @@ from main import (
     load_memory,
     logger,
     looks_like_order_message,
-    looks_like_receipt_business_message,
     missing_fields_reply,
     normalize_command,
     normalize_order_draft,
@@ -142,10 +141,6 @@ def classify_global_business_route(message: str) -> BusinessIntent:
         return BusinessIntent(GLOBAL_ROUTE_ORDER_QUERY, 0.95, "rule", "order storage query")
     if command_contains_any(command, BUSINESS_NEGATION_KEYWORDS):
         return BusinessIntent(GLOBAL_ROUTE_CHAT, 0.75, "rule", "business negation")
-    if looks_like_order_message(message):
-        return BusinessIntent(GLOBAL_ROUTE_ORDER_TEXT, 0.92, "rule", "order-like text")
-    if looks_like_receipt_business_message(message):
-        return BusinessIntent(GLOBAL_ROUTE_ENTER_RECEIPT, 0.9, "rule", "receipt-like text")
     if is_order_mode_command(command):
         return BusinessIntent(GLOBAL_ROUTE_ENTER_ORDER, 0.92, "rule", "order mode command")
     if is_receipt_mode_command(command):

@@ -654,15 +654,6 @@ def count_keyword_occurrences(text: str, keywords: set[str]) -> int:
     return sum(text.count(keyword) for keyword in keywords if keyword)
 
 
-def looks_like_receipt_business_message(message: str) -> bool:
-    command = normalize_command(message)
-    if is_business_query_or_negated(command) or is_question_like_command(command):
-        return False
-    if "入库" in command and command_contains_any(command, {"产成品", "成品", "车间", "照片", "图片", "清单", "记录", "记一下"}):
-        return True
-    return command_contains_any(command, {"产成品", "成品"}) and command_contains_any(command, {"照片", "图片", "车间", "入库"})
-
-
 def build_download_url(path: str) -> str:
     if PUBLIC_BASE_URL:
         return f"{PUBLIC_BASE_URL}{path}"
