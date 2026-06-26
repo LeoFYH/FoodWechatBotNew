@@ -116,6 +116,18 @@ from main import (
 )
 
 
+# ====== 重复用户回复模板抽常量(P10 步骤2，文案逐字不变) ======
+ENTER_ORDER_MODE_REPLY = "好的，进入订单模式了，直接发订单文字、Excel 或照片都行，发“退出”就退出。"
+ENTER_RECEIPT_MODE_REPLY = "好的，进入入库模式了，发产成品入库照片就行，发“退出”就退出。"
+HUMAN_TRANSFER_REPLY = "这个我不瞎承诺，我帮您转人工处理。"
+NO_ORDER_DRAFT_REPLY = "现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。"
+ORDER_DRAFT_CLEARED_REPLY = "已清空当前订单草稿，并回到普通聊天。要继续录单再发“订单”。"
+NO_RECEIPT_DRAFT_REPLY = "现在没有待确认的入库草稿。发产成品入库照片给我就行。"
+RECEIPT_DRAFT_CLEARED_REPLY = "已清空当前入库草稿，并回到普通聊天。要继续入库再发“入库”。"
+CONFIRM_HINT_MODIFY = "\n确认无误请回复“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
+CONFIRM_HINT_CONTINUE_MODIFY = "\n确认无误请回复“确认 / 对 / ok / yes”；要继续修改就直接发修改内容。"
+
+
 def call_global_business_route_llm(messages: list[dict[str, str]]) -> str:
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -186,19 +198,19 @@ def order_draft_reply(prefix: str, draft: dict[str, Any], missing: list[str]) ->
     summary = format_order_draft_summary(draft)
     if missing:
         return prefix + "\n" + summary + "\n" + missing_fields_reply(missing)
-    return prefix + "\n" + summary + "\n确认无误请回复“确认 / 对 / ok / yes”；要继续修改就直接发修改内容。"
+    return prefix + "\n" + summary + CONFIRM_HINT_CONTINUE_MODIFY
 
 def receipt_draft_reply(prefix: str, draft: dict[str, Any], missing: list[str]) -> str:
     summary = format_receipt_draft_summary(draft)
     if missing:
         return prefix + "\n" + summary + "\n" + missing_fields_reply(missing, receipt=True)
-    return prefix + "\n" + summary + "\n确认无误请回复“确认 / 对 / ok / yes”；要继续修改就直接发修改内容。"
+    return prefix + "\n" + summary + CONFIRM_HINT_CONTINUE_MODIFY
 
 def save_confirmed_order_response(user_id: str, draft: dict[str, Any], history_length: int) -> ChatResponse:
     if not order_draft_has_content(draft):
         return ChatResponse(
             user_id=user_id,
-            answer="现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。",
+            answer=NO_ORDER_DRAFT_REPLY,
             history_length=history_length,
         )
     missing = order_draft_missing_fields(draft)
@@ -380,7 +392,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
         clear_order_draft(user_id, next_mode=SESSION_MODE_CHAT)
         return ChatResponse(
             user_id=user_id,
-            answer="已清空当前订单草稿，并回到普通聊天。要继续录单再发“订单”。",
+            answer=ORDER_DRAFT_CLEARED_REPLY,
             history_length=history_length,
         )
 
@@ -392,7 +404,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 answer=(
                     "当前订单草稿：\n"
                     + summary
-                    + "\n确认无误请回复“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
+                    + CONFIRM_HINT_MODIFY
                 ),
                 history_length=history_length,
             )
@@ -402,7 +414,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
             clear_order_draft(user_id, next_mode=SESSION_MODE_CHAT)
             return ChatResponse(
                 user_id=user_id,
-                answer="已清空当前订单草稿，并回到普通聊天。要继续录单再发“订单”。",
+                answer=ORDER_DRAFT_CLEARED_REPLY,
                 history_length=history_length,
             )
         if intent.intent == INTENT_EXIT and intent.is_rule:
@@ -449,7 +461,7 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
     if is_confirm_command(command):
         return ChatResponse(
             user_id=user_id,
-            answer="现在没有待确认的订单草稿。直接发订单文字、Excel 或照片都行。",
+            answer=NO_ORDER_DRAFT_REPLY,
             history_length=history_length,
         )
 
@@ -564,7 +576,7 @@ def save_confirmed_receipt_response(user_id: str, draft: dict[str, Any]) -> Chat
     if not receipt_draft_has_content(draft):
         return ChatResponse(
             user_id=user_id,
-            answer="现在没有待确认的入库草稿。发产成品入库照片给我就行。",
+            answer=NO_RECEIPT_DRAFT_REPLY,
             history_length=0,
         )
     missing = receipt_missing_fields(draft)
@@ -600,7 +612,7 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
         clear_receipt_draft(user_id, next_mode=SESSION_MODE_CHAT)
         return ChatResponse(
             user_id=user_id,
-            answer="已清空当前入库草稿，并回到普通聊天。要继续入库再发“入库”。",
+            answer=RECEIPT_DRAFT_CLEARED_REPLY,
             history_length=0,
         )
 
@@ -610,7 +622,7 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
             clear_receipt_draft(user_id, next_mode=SESSION_MODE_CHAT)
             return ChatResponse(
                 user_id=user_id,
-                answer="已清空当前入库草稿，并回到普通聊天。要继续入库再发“入库”。",
+                answer=RECEIPT_DRAFT_CLEARED_REPLY,
                 history_length=0,
             )
         if intent.intent == INTENT_EXIT and intent.is_rule:
@@ -650,7 +662,7 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
     if is_confirm_command(command):
         return ChatResponse(
             user_id=user_id,
-            answer="现在没有待确认的入库草稿。发产成品入库照片给我就行。",
+            answer=NO_RECEIPT_DRAFT_REPLY,
             history_length=0,
         )
 
@@ -685,7 +697,7 @@ def needs_human_transfer(message: str) -> bool:
 
 def handle_general_chat(user_id: str, message: str, mode_hint: str | None = None) -> ChatResponse:
     if needs_human_transfer(message):
-        answer = "这个我不瞎承诺，我帮您转人工处理。"
+        answer = HUMAN_TRANSFER_REPLY
         if mode_hint:
             answer = append_mode_hint(answer, mode_hint)
         return ChatResponse(user_id=user_id, answer=answer, history_length=0)
@@ -803,7 +815,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
         return ChatResponse(user_id=user_id, answer=answer, history_length=user_order_count(user_id))
 
     if needs_human_transfer(message):
-        return ChatResponse(user_id=user_id, answer="这个我不瞎承诺，我帮您转人工处理。", history_length=0)
+        return ChatResponse(user_id=user_id, answer=HUMAN_TRANSFER_REPLY, history_length=0)
 
     if has_order_draft and has_receipt_draft:
         return ChatResponse(
@@ -847,7 +859,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             return ChatResponse(user_id=user_id, answer=blocked, history_length=user_order_count(user_id))
         return ChatResponse(
             user_id=user_id,
-            answer="好的，进入订单模式了，直接发订单文字、Excel 或照片都行，发“退出”就退出。",
+            answer=ENTER_ORDER_MODE_REPLY,
             history_length=user_order_count(user_id),
         )
 
@@ -857,7 +869,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             return ChatResponse(user_id=user_id, answer=blocked, history_length=0)
         return ChatResponse(
             user_id=user_id,
-            answer="好的，进入入库模式了，发产成品入库照片就行，发“退出”就退出。",
+            answer=ENTER_RECEIPT_MODE_REPLY,
             history_length=0,
         )
 
@@ -901,7 +913,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             return ChatResponse(user_id=user_id, answer=blocked, history_length=user_order_count(user_id))
         return ChatResponse(
             user_id=user_id,
-            answer="好的，进入订单模式了，直接发订单文字、Excel 或照片都行，发“退出”就退出。",
+            answer=ENTER_ORDER_MODE_REPLY,
             history_length=user_order_count(user_id),
         )
     if route.intent == GLOBAL_ROUTE_ENTER_RECEIPT:
@@ -910,7 +922,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             return ChatResponse(user_id=user_id, answer=blocked, history_length=0)
         return ChatResponse(
             user_id=user_id,
-            answer="好的，进入入库模式了，发产成品入库照片就行，发“退出”就退出。",
+            answer=ENTER_RECEIPT_MODE_REPLY,
             history_length=0,
         )
     if route.intent == GLOBAL_ROUTE_ORDER_QUERY:
@@ -1015,7 +1027,7 @@ def handle_excel_order_input(user_id: str, file_bytes: bytes, raw_ref: str) -> C
         answer=(
             f"我把 Excel 解析成待确认订单，共 {line_count} 行商品：\n"
             + summary
-            + "\n确认无误请回复“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
+            + CONFIRM_HINT_MODIFY
         ),
         history_length=user_order_count(user_id),
     )
@@ -1055,7 +1067,7 @@ def handle_photo_order_input(user_id: str, image_bytes: bytes, mime_type: str | 
         answer = (
             "我把照片识别成待确认订单：\n"
             + summary
-            + "\n确认无误请回复“确认 / 对 / ok / yes”；要修改就直接发修改内容。"
+            + CONFIRM_HINT_MODIFY
         )
 
     return ChatResponse(
