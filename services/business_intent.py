@@ -24,7 +24,7 @@ ALLOWED_INTENTS = {
     INTENT_UNCLEAR,
 }
 
-LLM_CONFIRM_THRESHOLD = 0.8
+LLM_CONFIRM_THRESHOLD = 0.85  # confirm 是写库危险动作，门槛抬高；不够当未确认（兜底不写）
 LLM_MODIFY_THRESHOLD = 0.75
 LLM_REJECT_THRESHOLD = 0.75
 
@@ -206,17 +206,13 @@ def classify_by_rules(message: str, *, has_draft: bool) -> BusinessIntent:
 
     if text in DRAFT_AMBIGUOUS_NO_ACTION:
         return BusinessIntent(INTENT_CHAT, 0.7, "rule", "ambiguous no-action reply")
+    # 取消/退出保持确定性（逃逸出口）；item 级取消归 modify（防止"取消某商品"被当成清整单）。
     if looks_like_item_level_cancel(text):
         return BusinessIntent(INTENT_MODIFY, 0.92, "rule", "item cancel keyword")
     if contains_any(text, CANCEL_KEYWORDS):
         return BusinessIntent(INTENT_CANCEL, 0.98, "rule", "cancel keyword")
-    if looks_like_correction(text):
-        return BusinessIntent(INTENT_MODIFY, 0.92, "rule", "correction keyword")
-    if contains_any(text, REJECT_KEYWORDS):
-        return BusinessIntent(INTENT_REJECT, 0.92, "rule", "reject keyword")
-    if looks_like_confirm_action(text):
-        return BusinessIntent(INTENT_CONFIRM, 0.95, "rule", "confirm phrase")
-
+    # 确认/拒绝/修改 不再用关键词预判（曾因 "好"前缀把"好吧你干的好棒啊"误判成确认写库）。
+    # 一律落到 UNCLEAR，交 classify_business_intent 的 LLM 段判（confirm 还要过两道闸，见 dispatch）。
     return BusinessIntent(INTENT_UNCLEAR, 0.0, "rule", "needs llm")
 
 
@@ -302,8 +298,8 @@ def classify_business_intent(
         return BusinessIntent(INTENT_UNCLEAR, 0.0, "llm_error", "classifier failed")
 
     llm_intent = parse_llm_intent(raw_result)
-    text = normalize_reply(message)
-    if llm_intent.intent == INTENT_CONFIRM and llm_intent.confidence >= LLM_CONFIRM_THRESHOLD and looks_like_confirm_action(text):
+    # confirm 不再要关键词共闸（纯 AI 判），但置信度门槛抬到 0.85；不够 → 落 UNCLEAR（兜底不写）。
+    if llm_intent.intent == INTENT_CONFIRM and llm_intent.confidence >= LLM_CONFIRM_THRESHOLD:
         return llm_intent
     if llm_intent.intent == INTENT_MODIFY and llm_intent.confidence >= LLM_MODIFY_THRESHOLD:
         return llm_intent

@@ -180,7 +180,9 @@ class RoutingStateTests(unittest.TestCase):
                 ],
             }
         )
-        with patch.object(self.dispatch, "llm_receipt_draft_from_message", return_value=updated) as skill:
+        with patch.object(
+            self.dispatch, "call_business_intent_llm", return_value='{"intent":"modify","confidence":0.9}'
+        ), patch.object(self.dispatch, "llm_receipt_draft_from_message", return_value=updated) as skill:
             response = self.main.handle_user_message("u1", "鲜肉馄饨改成20件")
         skill.assert_called_once()
         draft = self.main.get_receipt_draft("u1")
@@ -211,7 +213,9 @@ class RoutingStateTests(unittest.TestCase):
                 ],
             }
         )
-        with patch.object(self.dispatch, "llm_order_draft_from_message", return_value=updated) as skill:
+        with patch.object(
+            self.dispatch, "call_business_intent_llm", return_value='{"intent":"modify","confidence":0.9}'
+        ), patch.object(self.dispatch, "llm_order_draft_from_message", return_value=updated) as skill:
             response = self.main.handle_user_message("u1", "鸡腿改成30件 再加鸭腿8件")
         skill.assert_called_once()
         draft = self.main.get_order_draft("u1")
@@ -231,7 +235,9 @@ class RoutingStateTests(unittest.TestCase):
                 "change_type": "add",
             },
         )
-        with patch.object(self.dispatch, "llm_order_draft_from_message", return_value=None):
+        with patch.object(
+            self.dispatch, "call_business_intent_llm", return_value='{"intent":"modify","confidence":0.9}'
+        ), patch.object(self.dispatch, "llm_order_draft_from_message", return_value=None):
             response = self.main.handle_user_message("u1", "鸡腿改成30件")
         draft = self.main.get_order_draft("u1")
         self.assertIn("没解析成功", response.answer)
@@ -287,7 +293,10 @@ class RoutingStateTests(unittest.TestCase):
 
     def test_draft_state_reject_keeps_receipt_draft(self) -> None:
         self.main.save_receipt_draft("u1", dict(self._RECEIPT_DRAFT_FIXTURE))
-        response = self.main.handle_user_message("u1", "先不入库")
+        with patch.object(
+            self.dispatch, "call_business_intent_llm", return_value='{"intent":"reject","confidence":0.9}'
+        ):
+            response = self.main.handle_user_message("u1", "先不入库")  # 拒绝现由 AI 判
         self.assertIn("先不保存", response.answer)  # 拒绝走 REJECT 分支
         self.assertTrue(self.main.receipt_draft_has_content(self.main.get_receipt_draft("u1")))  # 草稿仍在
 
@@ -303,7 +312,7 @@ class RoutingStateTests(unittest.TestCase):
         self.assertIn("那单还在", response.answer)  # 草稿提醒
         self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
 
-    # ---- 危险动作语境修复：撤销三道闸 / "好吧"不算确认 / 提示语补取消出口 ----
+    # ---- 危险动作语境修复：撤销两道闸(AI判) / "好吧"不算确认 / 提示语补取消出口 ----
 
     def test_reluctant_haoba_is_not_confirm_keeps_draft(self) -> None:
         # "好吧"勉强语气 → 不再被判成确认写库；走闲聊+提醒，草稿仍在。
@@ -325,8 +334,8 @@ class RoutingStateTests(unittest.TestCase):
         self.assertNotIn("确认撤回", r2.answer)
         self.assertEqual(self.main.get_pending_revoke("u1"), "")  # 没进二次确认
 
-    def test_revoke_three_gates_confirm_then_yes(self) -> None:
-        # 三道闸：AI 判要撤 → 二次确认(带数据，未撤) → 用户"是" → 才真撤。
+    def test_revoke_two_gates_confirm_then_yes(self) -> None:
+        # 两道闸：AI 判要撤 → 二次确认(带数据，未撤) → AI 判"是确认" → 才真撤。
         self.main.insert_order_payload(
             {
                 "kind": "base",
@@ -339,20 +348,21 @@ class RoutingStateTests(unittest.TestCase):
         )
         self.assertEqual(len(self.main.query_order_payloads()), 1)
 
-        with patch.object(self.dispatch, "revoke_intent_is_real", return_value=True):
+        with patch.object(self.dispatch, "revoke_intent_is_real", return_value=True):  # 一道
             confirm = self.main.handle_user_message("u1", "撤销上一单")
         self.assertIn("确认撤回", confirm.answer)  # 二次确认
         self.assertIn("鼓楼店", confirm.answer)  # 逐字带数据
         self.assertEqual(self.main.get_pending_revoke("u1"), "order")  # pending 已设
         self.assertEqual(len(self.main.query_order_payloads()), 1)  # 此刻还没撤
 
-        response = self.main.handle_user_message("u1", "是")  # 第三道：代码识别"是"才撤
+        with patch.object(self.dispatch, "revoke_confirm_is_real", return_value=True):  # 二道：AI 判是确认
+            response = self.main.handle_user_message("u1", "是")
         self.assertIn("撤回了", response.answer)
         self.assertEqual(self.main.get_pending_revoke("u1"), "")  # pending 清
         self.assertEqual(len(self.main.query_order_payloads()), 0)  # 已撤
 
     def test_revoke_pending_non_yes_does_not_revoke(self) -> None:
-        # pending 已设但用户回的不是"是" → 撤销作罢、清 pending、订单仍在。
+        # pending 已设但 AI 判"不是确认"(否定/失败兜底) → 撤销作罢、清 pending、订单仍在。
         self.main.insert_order_payload(
             {
                 "kind": "base",
@@ -364,7 +374,9 @@ class RoutingStateTests(unittest.TestCase):
             }
         )
         self.main.set_pending_revoke("u1", "order")
-        with patch.object(self.dispatch, "call_customer_chat_llm", return_value="嗯好。"):
+        with patch.object(self.dispatch, "revoke_confirm_is_real", return_value=False), patch.object(
+            self.dispatch, "call_customer_chat_llm", return_value="嗯好。"
+        ):
             response = self.main.handle_user_message("u1", "算了不撤了")
         self.assertNotIn("撤回了", response.answer)
         self.assertEqual(self.main.get_pending_revoke("u1"), "")  # pending 清
@@ -373,6 +385,86 @@ class RoutingStateTests(unittest.TestCase):
     def test_draft_confirm_hint_mentions_cancel_exit(self) -> None:
         self.assertIn("取消", self.dispatch.CONFIRM_HINT_MODIFY)
         self.assertIn("取消", self.dispatch.CONFIRM_HINT_CONTINUE_MODIFY)
+
+    # ---- 确认两道闸(纯 AI 判) ----
+
+    _CONFIRMABLE_ORDER = {
+        "kind": "base",
+        "source": "text",
+        "store": "老三家",
+        "items": [{"name": "鸡腿", "qty": 20, "unit": "件"}],
+    }
+    _CONFIRM_JSON = '{"intent":"confirm","confidence":0.95}'
+
+    def test_confirm_two_gates_echo_then_write(self) -> None:
+        # 一道 AI 判 confirm → 模板回显、未写库、pending 已设；二道 AI 再判 confirm → 才真写库。
+        self.main.save_order_draft("u1", dict(self._CONFIRMABLE_ORDER))
+
+        with patch.object(self.dispatch, "call_business_intent_llm", return_value=self._CONFIRM_JSON):
+            gate1 = self.main.handle_user_message("u1", "确认")
+        self.assertIn("请最后确认", gate1.answer)             # 模板回显那屏
+        self.assertIn("老三家", gate1.answer)                 # 逐字带数据（走模板）
+        self.assertNotIn("已保存订单入库", gate1.answer)       # 一道绝不写
+        self.assertEqual(self.main.get_pending_confirm("u1"), "order")  # pending 已设
+        self.assertEqual(self.main.user_order_count("u1"), 0)           # 没写库
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
+
+        with patch.object(self.dispatch, "call_business_intent_llm", return_value=self._CONFIRM_JSON):
+            gate2 = self.main.handle_user_message("u1", "确认")
+        self.assertIn("已保存订单入库", gate2.answer)          # 二道才写
+        self.assertEqual(self.main.get_pending_confirm("u1"), "")       # pending 清
+        self.assertEqual(self.main.user_order_count("u1"), 1)           # 已写库
+
+    def test_first_confirm_never_writes_even_if_ai_says_confirm(self) -> None:
+        # 安全边界：即便 AI 第一条就判 confirm，一道也只回显、绝不写库（必须两条独立确认）。
+        self.main.save_order_draft("u1", dict(self._CONFIRMABLE_ORDER))
+        with patch.object(self.dispatch, "call_business_intent_llm", return_value='{"intent":"confirm","confidence":0.99}'):
+            first = self.main.handle_user_message("u1", "好吧你干的好棒啊")
+        self.assertNotIn("已保存订单入库", first.answer)
+        self.assertEqual(self.main.user_order_count("u1"), 0)            # 一道不写
+        self.assertEqual(self.main.get_pending_confirm("u1"), "order")   # 只进了一道
+
+    def test_haoba_praise_does_not_write(self) -> None:
+        # 生产事故复现：曾因 "好"前缀把"好吧你干的好棒啊"误判 confirm 单道写库（ID 23）。
+        # 现纯 AI 判 → chat，不进确认闸、不写库、草稿仍在。
+        self.main.save_order_draft("u1", dict(self._CONFIRMABLE_ORDER))
+        with patch.object(
+            self.dispatch, "call_business_intent_llm", return_value='{"intent":"chat","confidence":0.95}'
+        ), patch.object(self.dispatch, "call_customer_chat_llm", return_value="谢谢。"):
+            response = self.main.handle_user_message("u1", "好吧 你干的好棒啊")
+        self.assertNotIn("已保存订单入库", response.answer)
+        self.assertEqual(self.main.user_order_count("u1"), 0)            # 没写库
+        self.assertEqual(self.main.get_pending_confirm("u1"), "")        # 没进确认闸
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
+
+    def test_confirm_ai_failure_does_not_write(self) -> None:
+        # 安全边界 c：AI 判失败/超时 → 当未确认，绝不写库，回澄清。
+        self.main.save_order_draft("u1", dict(self._CONFIRMABLE_ORDER))
+        with patch.object(self.dispatch, "call_business_intent_llm", side_effect=RuntimeError("boom")):
+            response = self.main.handle_user_message("u1", "确认")
+        self.assertNotIn("已保存订单入库", response.answer)
+        self.assertEqual(self.main.user_order_count("u1"), 0)            # 没写库
+        self.assertEqual(self.main.get_pending_confirm("u1"), "")        # 没进确认闸
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
+
+    def test_cancel_clears_pending_confirm_immediately(self) -> None:
+        # 取消即时生效：即便处在待确认态，"取消"立刻清草稿+清 pending，不写不卡（确定性出口）。
+        self.main.save_order_draft("u1", dict(self._CONFIRMABLE_ORDER))
+        self.main.set_pending_confirm("u1", "order")
+        response = self.main.handle_user_message("u1", "取消")
+        self.assertIn("已清空", response.answer)
+        self.assertEqual(self.main.get_pending_confirm("u1"), "")
+        self.assertEqual(self.main.user_order_count("u1"), 0)
+        self.assertFalse(self.main.order_draft_has_content(self.main.get_order_draft("u1")))
+
+    def test_exit_clears_pending_confirm_immediately(self) -> None:
+        # 退出即时生效：待确认态下"退出"立刻回普通聊天并清 pending（确定性出口）。
+        self.main.save_order_draft("u1", dict(self._CONFIRMABLE_ORDER))
+        self.main.set_pending_confirm("u1", "order")
+        response = self.main.handle_user_message("u1", "退出")
+        self.assertIn("退出", response.answer)
+        self.assertEqual(self.main.get_pending_confirm("u1"), "")
+        self.assertEqual(self.main.get_session_mode("u1"), self.main.SESSION_MODE_CHAT)
 
     def test_order_draft_view_command_shows_current_draft_without_llm(self) -> None:
         self.main.save_order_draft(
@@ -440,7 +532,9 @@ class RoutingStateTests(unittest.TestCase):
             "u1",
             {"date": "2026-06-24", "items": [{"name": "鲜肉馄饨", "qty": 10, "unit": "箱"}]},
         )
-        with patch.object(self.dispatch, "llm_receipt_draft_from_message", return_value=None):
+        with patch.object(
+            self.dispatch, "call_business_intent_llm", return_value='{"intent":"modify","confidence":0.9}'
+        ), patch.object(self.dispatch, "llm_receipt_draft_from_message", return_value=None):
             response = self.main.handle_user_message("u1", "鲜肉馄饨改成20件")
         draft = self.main.get_receipt_draft("u1")
         self.assertIn("没解析成功", response.answer)

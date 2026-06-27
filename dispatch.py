@@ -30,10 +30,12 @@ from main import (
     BusinessIntent,
     CUSTOMER_CHAT_PROMPT,
     ChatResponse,
+    clear_pending_confirm,
     clear_pending_revoke,
+    get_pending_confirm,
     get_pending_revoke,
-    is_revoke_confirm,
     query_order_payloads,
+    set_pending_confirm,
     set_pending_revoke,
     summarize_order_for_reply,
     GLOBAL_ROUTE_CHAT,
@@ -229,30 +231,64 @@ def llm_reply(skill: str, context: str, *, fallback: str = "") -> str:
     return reply or fallback
 
 
-def revoke_intent_is_real(message: str) -> bool:
-    """撤销三道闸第一道：用现有 LLM 通道判用户是不是【明确要撤销】一笔已确认的订单/入库，
-    而非疑问("能撤吗")、否定("别撤")、只是提到。AI 只提议（决定要不要发二次确认），不执行撤销。
-    任何失败/不确定一律保守返回 False（不撤、不发二次确认）。"""
+# 危险动作（写库确认 / 撤销）AI 判的置信度门槛：不到一律当"否"，往不动数据兜底（安全边界 b）。
+LLM_DANGER_THRESHOLD = 0.85
+
+
+def _ai_danger_yes(message: str, system_prompt: str, key: str) -> bool:
+    """危险动作 AI 判的统一通道：让 AI 输出 {key:bool, confidence:0~1}，
+    只有 key 为真【且】confidence≥门槛才算 True。任何异常/超时/JSON 非法/置信不足 → False。
+    这是"判用 AI、失败兜底不动数据"的落点：撤销/确认的 AI 判都走它。"""
     try:
         raw = call_business_intent_llm(
             [
-                {
-                    "role": "system",
-                    "content": (
-                        "判断用户这句话是不是【明确要撤销/撤回】一笔已经确认入库的订单或入库记录。"
-                        "只输出 JSON：{\"revoke\":true} 或 {\"revoke\":false}。"
-                        "明确要撤=true；疑问(能撤吗/可以撤吗/怎么撤)、否定(别撤/先不撤/不用撤)、"
-                        "只是提到撤销=false。不要输出别的。"
-                    ),
-                },
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": message},
             ]
         )
         data = extract_json_object(raw)
     except Exception as exc:
-        logger.warning("revoke_intent_judge_failed error=%s", exc)
+        logger.warning("ai_danger_judge_failed key=%s error=%s", key, exc)
         return False
-    return data.get("revoke") is True
+    if data.get(key) is not True:
+        return False
+    try:
+        confidence = float(data.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return confidence >= LLM_DANGER_THRESHOLD
+
+
+def revoke_intent_is_real(message: str) -> bool:
+    """撤销两道闸·第一道：AI 判用户是不是【明确要撤销】一笔已确认的订单/入库，
+    而非疑问("能撤吗")、否定("别撤")、只是提到。AI 只提议（决定要不要发二次确认），不执行撤销。
+    置信度<0.85 或失败 → False（不撤、不发二次确认）。"""
+    return _ai_danger_yes(
+        message,
+        (
+            "判断用户这句话是不是【明确要撤销/撤回】一笔已经确认入库的订单或入库记录。"
+            "只输出 JSON：{\"revoke\":true,\"confidence\":0~1} 或 {\"revoke\":false,\"confidence\":0~1}。"
+            "明确要撤=true；疑问(能撤吗/可以撤吗/怎么撤)、否定(别撤/先不撤/不用撤)、"
+            "只是提到撤销=false。confidence 是你的把握度。不要输出别的。"
+        ),
+        "revoke",
+    )
+
+
+def revoke_confirm_is_real(message: str) -> bool:
+    """撤销两道闸·第二道（替代旧的关键词"是"识别）：上一步已回显要撤的那单，
+    AI 判用户这句是不是【明确确认执行撤销】(回 是/对/确认/撤吧 之类)。
+    否定(不/别/算了)、疑问、改主意、别的话题、置信不足、失败 → False（不撤）。"""
+    return _ai_danger_yes(
+        message,
+        (
+            "上一步已经问用户'确认撤回吗'。判断用户这句是不是【明确确认、同意执行撤销】。"
+            "只输出 JSON：{\"confirm\":true,\"confidence\":0~1} 或 {\"confirm\":false,\"confidence\":0~1}。"
+            "是/对/确认/撤吧/嗯撤=true；否定(不/别/算了/先不)、疑问、改主意、别的话题=false。"
+            "confidence 是你的把握度。不要输出别的。"
+        ),
+        "confirm",
+    )
 
 
 def peek_latest_cancellable_order(user_id: str) -> dict[str, Any] | None:
@@ -293,6 +329,22 @@ def receipt_draft_reply(prefix: str, draft: dict[str, Any], missing: list[str]) 
     if missing:
         return prefix + "\n" + summary + "\n" + missing_fields_reply(missing, receipt=True)
     return prefix + "\n" + summary + CONFIRM_HINT_CONTINUE_MODIFY
+
+def order_confirm_echo(draft: dict[str, Any]) -> str:
+    # 确认两道闸·第一道回显：整单逐字走模板（format_order_draft_summary），AI 不碰数字（安全边界 a）。
+    return (
+        "请最后确认这单要写入订单库：\n"
+        + format_order_draft_summary(draft)
+        + "\n确认无误回“确认”写库；要改直接发修改内容；不要这单回“取消”。"
+    )
+
+def receipt_confirm_echo(draft: dict[str, Any]) -> str:
+    # 同上，入库回显逐字走模板。
+    return (
+        "请最后确认这条要写入入库库：\n"
+        + format_receipt_draft_summary(draft)
+        + "\n确认无误回“确认”写库；要改直接发修改内容；不要这条回“取消”。"
+    )
 
 def save_confirmed_order_response(user_id: str, draft: dict[str, Any], history_length: int) -> ChatResponse:
     if not order_draft_has_content(draft):
@@ -498,6 +550,8 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
             )
 
         intent = classify_order_reply_intent(message, existing_draft)
+        if intent.intent != INTENT_CONFIRM:
+            clear_pending_confirm(user_id)  # 任何非确认回复都打断"待确认"态，绝不延续到下一条
         if intent.intent == INTENT_CANCEL and intent.is_rule:
             clear_order_draft(user_id, next_mode=SESSION_MODE_CHAT)
             return ChatResponse(
@@ -512,7 +566,24 @@ def handle_order_user_message(user_id: str, message: str, raw_ref: str | None = 
                 history_length=0,
             )
         if intent.intent == INTENT_CONFIRM:
-            return save_confirmed_order_response(user_id, existing_draft, history_length)
+            # 确认两道闸：一道 AI 判 confirm(≥0.85) → 不写、模板回显、set pending；
+            # 二道 AI 再判 confirm → 才真写库。两次都是独立 AI 判，中间回显走模板（安全边界 a/b）。
+            if get_pending_confirm(user_id) == "order":
+                clear_pending_confirm(user_id)
+                return save_confirmed_order_response(user_id, existing_draft, history_length)
+            missing = order_draft_missing_fields(existing_draft)
+            if missing:
+                return ChatResponse(
+                    user_id=user_id,
+                    answer=missing_fields_reply(missing),
+                    history_length=history_length,
+                )
+            set_pending_confirm(user_id, "order")
+            return ChatResponse(
+                user_id=user_id,
+                answer=order_confirm_echo(existing_draft),
+                history_length=history_length,
+            )
         if intent.intent == INTENT_REJECT:
             return ChatResponse(
                 user_id=user_id,
@@ -714,6 +785,8 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
 
     if has_existing_draft:
         intent = classify_receipt_reply_intent(message, draft)
+        if intent.intent != INTENT_CONFIRM:
+            clear_pending_confirm(user_id)  # 任何非确认回复都打断"待确认"态
         if intent.intent == INTENT_CANCEL and intent.is_rule:
             clear_receipt_draft(user_id, next_mode=SESSION_MODE_CHAT)
             return ChatResponse(
@@ -728,7 +801,23 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
                 history_length=0,
             )
         if intent.intent == INTENT_CONFIRM:
-            return save_confirmed_receipt_response(user_id, draft)
+            # 入库确认两道闸：一道回显当前入库草稿(模板逐字)、set pending；二道 AI 再判 confirm 才写库。
+            if get_pending_confirm(user_id) == "receipt":
+                clear_pending_confirm(user_id)
+                return save_confirmed_receipt_response(user_id, draft)
+            missing = receipt_missing_fields(draft)
+            if missing:
+                return ChatResponse(
+                    user_id=user_id,
+                    answer=missing_fields_reply(missing, receipt=True),
+                    history_length=0,
+                )
+            set_pending_confirm(user_id, "receipt")
+            return ChatResponse(
+                user_id=user_id,
+                answer=receipt_confirm_echo(draft),
+                history_length=0,
+            )
         if intent.intent == INTENT_REJECT:
             return ChatResponse(
                 user_id=user_id,
@@ -867,17 +956,18 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
     has_receipt_draft = has_raw_receipt_draft(record)
     has_any_draft = has_order_draft or has_receipt_draft
 
-    # 撤销三道闸·第三道：上一步已问"确认撤回？回是"，这步只接确定性"是"（is_revoke_confirm）→ 代码扣扳机真撤。
+    # 撤销两道闸·第二道：上一步已问"确认撤回？"，这步用 AI 判这句是不是确认撤（revoke_confirm_is_real，
+    # 含置信度门槛与失败兜底；不再用关键词"是"）→ 是才扣扳机真撤；判否/失败 → 撤销作罢。
     pending_revoke = get_pending_revoke(user_id)
     if pending_revoke:
         clear_pending_revoke(user_id)  # 一次性：无论撤不撤，先清掉待撤态
-        if is_revoke_confirm(command):
+        if revoke_confirm_is_real(message):
             if pending_revoke == "receipt":
                 answer = cancel_latest_receipt_for_user(user_id)
             else:
                 answer = cancel_latest_order_for_user(user_id)
             return ChatResponse(user_id=user_id, answer=answer, history_length=user_order_count(user_id))
-        # 回的不是"是" → 撤销作罢，这条消息继续按正常流程处理（不 return，落到下面）
+        # AI 判不是确认（含失败兜底） → 撤销作罢，这条消息继续按正常流程处理（不 return，落到下面）
 
     if command in ORDER_EXPORT_COMMANDS:
         return ChatResponse(
@@ -918,16 +1008,17 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
             record = get_session_record(user_id)
             record.pop("order_draft", None)
             record.pop("receipt_draft", None)
+            record.pop("pending_confirm", None)  # 取消即时生效，连带清确认闸
             record["mode"] = SESSION_MODE_CHAT
             save_session_record(user_id, record)
             answer = "已清空当前草稿，并回到普通聊天。"
         return ChatResponse(user_id=user_id, answer=answer, history_length=0)
 
     if is_revoke_command(command):
-        # 撤销三道闸·第一道：AI 判语境（要撤 vs 疑问/否定/只是提到）。AI 只提议，不扣扳机。
+        # 撤销两道闸·第一道：AI 判语境(要撤 vs 疑问/否定/只是提到)，含置信度门槛与失败兜底。AI 只提议，不扣扳机。
         if revoke_intent_is_real(message):
             if current_mode == SESSION_MODE_RECEIPT or is_receipt_revoke_target(command):
-                # 入库撤销同样走三道闸；二次确认不带具体数据（receipt 查询无 raw_ref，无法只读定位那一条）。
+                # 入库撤销同样走两道闸；二次确认不带具体数据（receipt 查询无 raw_ref，无法只读定位那一条）。
                 set_pending_revoke(user_id, "receipt")
                 return ChatResponse(
                     user_id=user_id,
@@ -947,7 +1038,7 @@ def handle_user_message(user_id: str, message: str, raw_ref: str | None = None) 
                     answer="这单已被排产/发货使用，不能直接撤回，需要联系数据部处理。",
                     history_length=user_order_count(user_id),
                 )
-            # 撤销三道闸·第二道：代码二次确认，逐字列出要撤的那单（门店+商品+数量，模板，不经 AI）。
+            # 撤销两道闸·二次确认回显：逐字列出要撤的那单（门店+商品+数量，模板，不经 AI）。下一条由 AI 判是否确认。
             set_pending_revoke(user_id, "order")
             return ChatResponse(
                 user_id=user_id,
@@ -1228,10 +1319,15 @@ __all__ = [
     "load_chat_skill",
     "load_help_skill",
     "llm_reply",
+    "revoke_intent_is_real",
+    "revoke_confirm_is_real",
+    "peek_latest_cancellable_order",
     "classify_order_reply_intent",
     "business_confirm_clarification",
     "order_draft_reply",
     "receipt_draft_reply",
+    "order_confirm_echo",
+    "receipt_confirm_echo",
     "save_confirmed_order_response",
     "load_order_skill",
     "llm_order_draft_from_message",

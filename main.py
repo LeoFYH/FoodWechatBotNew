@@ -544,6 +544,7 @@ def switch_session_mode(user_id: str, mode: str, *, clear_drafts: bool = False) 
 
     record = get_session_record(user_id)
     record["mode"] = mode
+    record.pop("pending_confirm", None)  # 任何换模式 → 重置确认闸
     if clear_drafts or mode == SESSION_MODE_CHAT:
         record.pop("order_draft", None)
         record.pop("receipt_draft", None)
@@ -583,6 +584,8 @@ def exit_business_mode(user_id: str) -> str:
     record["mode"] = SESSION_MODE_CHAT
     record.pop("order_draft", None)
     record.pop("receipt_draft", None)
+    record.pop("pending_confirm", None)  # 退出 → 清确认闸与待撤态，绝不让残留态延续
+    record.pop("pending_revoke", None)
     save_session_record(user_id, record)
     if previous_mode == SESSION_MODE_ORDER:
         return "已退出订单模式，有事随时叫我。"
@@ -714,6 +717,25 @@ def clear_pending_revoke(user_id: str) -> None:
         save_session_record(user_id, record)
 
 
+# 确认两道闸的"待确认"会话态："order"/"receipt"/""。一道 AI 判 confirm → set + 模板回显（不写库）；
+# 二道再判 confirm → 才真写库后 clear。任何"草稿变更/清除/退出/换模式"都会清掉它（见下方各 draft 原语），
+# 保证 pending_confirm 只在【同一份未改动草稿】的相邻两条消息间存活，绝不让上一单的待确认态延续到新单。
+def get_pending_confirm(user_id: str) -> str:
+    return str(get_session_record(user_id).get("pending_confirm") or "")
+
+
+def set_pending_confirm(user_id: str, target: str) -> None:
+    record = get_session_record(user_id)
+    record["pending_confirm"] = target
+    save_session_record(user_id, record)
+
+
+def clear_pending_confirm(user_id: str) -> None:
+    record = get_session_record(user_id)
+    if record.pop("pending_confirm", None) is not None:
+        save_session_record(user_id, record)
+
+
 def get_session_mode(user_id: str) -> str:
     mode = str(get_session_record(user_id).get("mode") or SESSION_MODE_CHAT)
     if mode not in SESSION_MODES:
@@ -737,6 +759,7 @@ def save_order_draft(user_id: str, draft: dict[str, Any]) -> None:
     record["mode"] = SESSION_MODE_ORDER
     record["order_draft"] = normalize_order_draft(draft)
     record.pop("receipt_draft", None)
+    record.pop("pending_confirm", None)  # 草稿新建/被修改 → 重置确认闸，杜绝旧待确认态写新草稿
     save_session_record(user_id, record)
 
 
@@ -746,6 +769,7 @@ def clear_order_draft(user_id: str, *, next_mode: str = SESSION_MODE_ORDER) -> N
     record = get_session_record(user_id)
     record["mode"] = next_mode
     record.pop("order_draft", None)
+    record.pop("pending_confirm", None)  # 草稿被清 → 重置确认闸
     if next_mode == SESSION_MODE_CHAT:
         record.pop("receipt_draft", None)
     save_session_record(user_id, record)
@@ -763,6 +787,7 @@ def save_receipt_draft(user_id: str, draft: dict[str, Any]) -> None:
     record["mode"] = SESSION_MODE_RECEIPT
     record["receipt_draft"] = normalize_receipt_payload(draft)
     record.pop("order_draft", None)
+    record.pop("pending_confirm", None)  # 草稿新建/被修改 → 重置确认闸
     save_session_record(user_id, record)
 
 
@@ -772,6 +797,7 @@ def clear_receipt_draft(user_id: str, *, next_mode: str = SESSION_MODE_RECEIPT) 
     record = get_session_record(user_id)
     record["mode"] = next_mode
     record.pop("receipt_draft", None)
+    record.pop("pending_confirm", None)  # 草稿被清 → 重置确认闸
     if next_mode == SESSION_MODE_CHAT:
         record.pop("order_draft", None)
     save_session_record(user_id, record)
