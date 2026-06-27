@@ -101,9 +101,9 @@ class FindCandidatesTests(unittest.TestCase):
     def _rows(self):
         # product 1 has an alias; product 2 has none
         return [
-            {"id": 1, "code": "sku_1", "name": "鲜肉大馄饨", "alias": "鲜肉馄饨"},
-            {"id": 1, "code": "sku_1", "name": "鲜肉大馄饨", "alias": "猪肉馄饨"},
-            {"id": 2, "code": "sku_2", "name": "韭菜鸡蛋蒸饺", "alias": None},
+            {"id": 1, "code": "sku_1", "name": "鲜肉大馄饨", "spec": "340g*24", "alias": "鲜肉馄饨"},
+            {"id": 1, "code": "sku_1", "name": "鲜肉大馄饨", "spec": "340g*24", "alias": "猪肉馄饨"},
+            {"id": 2, "code": "sku_2", "name": "韭菜鸡蛋蒸饺", "spec": "500g", "alias": None},
         ]
 
     def test_ranks_and_matches_alias(self):
@@ -114,6 +114,8 @@ class FindCandidatesTests(unittest.TestCase):
         self.assertEqual(out[0]["matched_on"], "alias")
         self.assertEqual(out[0]["matched_text"], "鲜肉馄饨")
         self.assertEqual(out[0]["score"], 1.0)
+        # spec is returned so the calibrator can show / apply the standard spec
+        self.assertEqual(out[0]["spec"], "340g*24")
 
     def test_top_n_limit(self):
         conn = FakeConn(rows=self._rows())

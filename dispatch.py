@@ -70,6 +70,7 @@ from main import (
     build_order_storage_query_reply,
     build_status_message,
     business_mode_switch_blocked_reply,
+    calibrate_receipt_items,
     cancel_latest_order_for_user,
     cancel_latest_receipt_for_user,
     classify_business_intent,
@@ -105,6 +106,7 @@ from main import (
     logger,
     looks_like_order_message,
     missing_fields_reply,
+    models,
     normalize_command,
     normalize_order_draft,
     normalize_receipt_payload,
@@ -664,17 +666,31 @@ def format_receipt_draft_summary(draft: dict[str, Any]) -> str:
     if not items:
         lines.append("成品：未填写")
     else:
+        # PG 启用时才显示 SKU 校准标记(✅匹配标准/⚠待核对)；SQLite 回退保持原样
+        show_markers = models.is_enabled()
         lines.append("成品：")
         for index, item in enumerate(items, start=1):
             if not isinstance(item, dict):
                 continue
-            parts = [
-                str(item.get("code") or "").strip(),
-                str(item.get("name") or "未填写成品").strip(),
-                str(item.get("spec") or "").strip(),
-                f"{item.get('qty') if item.get('qty') is not None else '未填写数量'}{item.get('unit') or ''}",
-            ]
-            lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
+            name = str(item.get("name") or "未填写成品").strip()
+            spec = str(item.get("spec") or "").strip()
+            qty_unit = f"{item.get('qty') if item.get('qty') is not None else '未填写数量'}{item.get('unit') or ''}"
+            if show_markers:
+                # code 非空 = 校准匹配上标准 SKU；藏掉 sku_ 哈希码，只给 ✅/⚠ 标记
+                if str(item.get("code") or "").strip():
+                    parts = [name, spec, qty_unit]
+                    lines.append(f"{index}. ✅ {' / '.join(part for part in parts if part)}")
+                else:
+                    parts = [f"⚠ {name}（未匹配到标准SKU，请核对）", spec, qty_unit]
+                    lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
+            else:
+                parts = [
+                    str(item.get("code") or "").strip(),
+                    name,
+                    spec,
+                    qty_unit,
+                ]
+                lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
     return "\n".join(lines)
 
 def load_receipt_skill() -> str:
@@ -865,6 +881,42 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
         history_length=0,
     )
 
+def calibrate_receipt_draft(draft: dict[str, Any]) -> dict[str, Any]:
+    """照片识别后、存草稿前的 SKU 校准。只在 PG 启用时跑；任何异常都兜底为不校准。
+
+    只换 name/spec(+标准 code)，qty/unit 恒为照片值；匹配不上的行保留原值、code 留空，仍在草稿里。
+    """
+    if not models.is_enabled():
+        return draft  # SQLite 回退：完全是现在的行为，零影响
+    items = draft.get("items") if isinstance(draft.get("items"), list) else []
+    if not items:
+        return draft
+
+    def _find(name: str) -> list[dict[str, Any]]:
+        try:
+            return models.find_product_candidates(name, top_n=5, min_score=0.3)
+        except Exception as exc:
+            logger.warning("sku_calibrate_find_failed name=%s error=%s", name, exc)
+            return []
+
+    def _judge(prompt: str) -> Any:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "你只输出可解析 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+        return extract_json_object(response.choices[0].message.content or "")
+
+    try:
+        draft["items"] = calibrate_receipt_items(items, find_candidates=_find, judge=_judge)
+    except Exception as exc:
+        logger.warning("sku_calibrate_failed error=%s", exc)  # 整体异常 → 不校准，保留原识别
+    return draft
+
+
 def handle_receipt_photo_input(user_id: str, image_bytes: bytes, mime_type: str | None, raw_ref: str) -> ChatResponse:
     try:
         draft = llm_parse_receipt_photo(vision_client, VISION_MODEL, image_bytes, mime_type, raw_ref)
@@ -876,6 +928,7 @@ def handle_receipt_photo_input(user_id: str, image_bytes: bytes, mime_type: str 
             answer = "这张入库照片我没有识别成功。请重新拍清楚成品名称和数量后再发。"
         return ChatResponse(user_id=user_id, answer=answer, history_length=0)
 
+    draft = calibrate_receipt_draft(draft)
     save_receipt_draft(user_id, draft)
     missing = receipt_missing_fields(draft)
     answer = receipt_draft_reply("我把照片识别成待确认入库记录：", draft, missing)

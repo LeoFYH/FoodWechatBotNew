@@ -50,6 +50,7 @@ import models
 import store_sqlite  # 本地 SQLite 回退后端（双轨的 SQLite 这一轨；lock/db_file 由 main 注入）
 from order_normalize import *  # 订单归一化纯函数层（门面 re-export，调用点/测试可见性不变）
 from sku_normalize import *  # 入库 SKU 主数据归一化纯函数层（门面 re-export）
+from sku_calibrate import *  # 入库 SKU 校准纯函数层（门面 re-export）
 from excel_import import *  # Excel 订单解析层（门面 re-export）
 from llm_json import *  # 大模型输出 JSON 提取通用 helper（门面 re-export）
 from vision_import import *  # 视觉/照片解析层（client/model 由 main 注入；门面 re-export）

@@ -134,7 +134,7 @@ def find_product_candidates(
         return []
     rows = conn.execute(
         """
-        select p.id, p.code, p.name, a.alias
+        select p.id, p.code, p.name, p.spec, a.alias
         from products p
         left join product_aliases a
             on a.product_id = p.id and a.tenant_id = p.tenant_id
@@ -152,6 +152,7 @@ def find_product_candidates(
                 "product_id": pid,
                 "code": row.get("code") or "",
                 "name": row.get("name") or "",
+                "spec": row.get("spec") or "",
                 "aliases": [],
             }
             products[pid] = entry
@@ -177,6 +178,7 @@ def find_product_candidates(
                 "product_id": entry["product_id"],
                 "code": entry["code"],
                 "name": entry["name"],
+                "spec": entry["spec"],
                 "matched_on": matched_on,
                 "matched_text": matched_text,
                 "score": round(best_score, 4),
