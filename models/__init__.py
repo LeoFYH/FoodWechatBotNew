@@ -190,6 +190,14 @@ def cancel_latest_order_for_user(user_id: str) -> dict[str, Any]:
     return result
 
 
+def clear_orders_by_date(order_date: str) -> dict[str, Any]:
+    _require_redis()
+    redis_cache.record_operation("orders.clear_by_date", {"order_date": order_date})
+    result = pg_orders.clear_orders_by_date(order_date)
+    redis_cache.delete_pattern(_order_query_pattern())
+    return result
+
+
 def insert_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
     _require_redis()
     redis_cache.record_operation("production_receipts.insert", {"payload": payload})
@@ -218,6 +226,14 @@ def unmark_receipt_payloads(ids: list[Any]) -> dict[str, list[str]]:
     _require_redis()
     redis_cache.record_operation("production_receipts.unmark", {"ids": ids})
     result = pg_production_receipts.unmark_receipt_payloads(ids)
+    redis_cache.delete_pattern(_receipt_query_pattern())
+    return result
+
+
+def clear_receipts_by_date(date: str) -> dict[str, Any]:
+    _require_redis()
+    redis_cache.record_operation("production_receipts.clear_by_date", {"date": date})
+    result = pg_production_receipts.clear_receipts_by_date(date)
     redis_cache.delete_pattern(_receipt_query_pattern())
     return result
 
@@ -348,6 +364,8 @@ def find_product_candidates(
 __all__ = [
     "cancel_latest_order_for_user",
     "cancel_latest_receipt_for_user",
+    "clear_orders_by_date",
+    "clear_receipts_by_date",
     "database_url",
     "default_tenant_code",
     "find_product_candidates",

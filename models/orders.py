@@ -297,6 +297,34 @@ def unmark_order_payloads(ids: list[int]) -> dict[str, list[int]]:
         return {"succeeded": succeeded, "failed": failed}
 
 
+def clear_orders_by_date(order_date: str) -> dict[str, Any]:
+    """强删某 order_date 当天的所有订单（不分 new/fetched/cancelled、base/patch、confirmed 与否）。
+
+    按 order_date 列删，不按 created_at。order_items 有 on delete cascade 随之自动删；
+    order_fetch_events 是非级联外键，必须先删，否则删 orders 会被外键挡住。
+    """
+    target = required_date(order_date)
+    with connection() as conn:
+        tenant_id = ensure_tenant(conn)
+        rows = conn.execute(
+            "select id from orders where tenant_id = %s and order_date = %s order by id asc",
+            (tenant_id, target),
+        ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        if not ids:
+            return {"deleted": 0, "deleted_ids": []}
+
+        conn.execute(
+            "delete from order_fetch_events where tenant_id = %s and order_id = any(%s)",
+            (tenant_id, ids),
+        )
+        conn.execute(
+            "delete from orders where tenant_id = %s and order_date = %s",
+            (tenant_id, target),
+        )
+        return {"deleted": len(ids), "deleted_ids": ids}
+
+
 def cancel_latest_order_for_user(user_id: str) -> dict[str, Any]:
     with connection() as conn:
         tenant_id = ensure_tenant(conn)

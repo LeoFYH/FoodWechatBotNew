@@ -204,6 +204,29 @@ def unmark_receipt_payloads(ids: list[Any]) -> dict[str, list[str]]:
     return update_receipt_status(ids, RECEIPT_STATUS_CONFIRMED)
 
 
+def clear_receipts_by_date(receipt_date: str) -> dict[str, Any]:
+    """强删某 receipt_date 当天的所有入库记录。按 date 列删、不按 created_at、不分门店。
+
+    production_receipt_items 有 on delete cascade，随 production_receipts 自动删。
+    """
+    target = required_date(receipt_date)
+    with connection() as conn:
+        tenant_id = ensure_tenant(conn)
+        rows = conn.execute(
+            "select id from production_receipts where tenant_id = %s and receipt_date = %s order by id asc",
+            (tenant_id, target),
+        ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        if not ids:
+            return {"deleted": 0, "deleted_ids": []}
+
+        conn.execute(
+            "delete from production_receipts where tenant_id = %s and receipt_date = %s",
+            (tenant_id, target),
+        )
+        return {"deleted": len(ids), "deleted_ids": [receipt_id_label(receipt_id) for receipt_id in ids]}
+
+
 def cancel_latest_receipt_for_user(user_id: str, receipt_date: str) -> dict[str, Any]:
     with connection() as conn:
         tenant_id = ensure_tenant(conn)

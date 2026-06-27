@@ -300,6 +300,21 @@ def unmark_order_payloads(ids: list[int], *, db_file: Path, lock: Any) -> dict[s
             return {"succeeded": succeeded, "failed": failed}
 
 
+def clear_orders_by_date(order_date: str, *, db_file: Path, lock: Any) -> dict[str, Any]:
+    """强删 order_entries 里 order_date 等于该日期的所有订单。按 order_date 列删，不按 created_at。"""
+    with lock:
+        with order_db_connection(db_file) as conn:
+            rows = conn.execute(
+                "SELECT id FROM order_entries WHERE order_date = ? ORDER BY id ASC",
+                (order_date,),
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if ids:
+                conn.execute("DELETE FROM order_entries WHERE order_date = ?", (order_date,))
+                conn.commit()
+            return {"deleted": len(ids), "deleted_ids": ids}
+
+
 def cancel_latest_order_for_user(user_id: str, *, db_file: Path, lock: Any) -> str:
     with lock:
         with order_db_connection(db_file) as conn:
@@ -510,6 +525,21 @@ def update_receipt_payload_status(
             }
 
 
+def clear_receipts_by_date(date: str, *, db_file: Path, lock: Any) -> dict[str, Any]:
+    """强删 receipt_entries 里 date 等于该日期的所有入库记录。按 date 列删，不按 created_at。"""
+    with lock:
+        with receipt_db_connection(db_file) as conn:
+            rows = conn.execute(
+                "SELECT id FROM receipt_entries WHERE date = ? ORDER BY id ASC",
+                (date,),
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if ids:
+                conn.execute("DELETE FROM receipt_entries WHERE date = ?", (date,))
+                conn.commit()
+            return {"deleted": len(ids), "deleted_ids": [receipt_id_label(receipt_id) for receipt_id in ids]}
+
+
 def cancel_latest_receipt_for_user(user_id: str, today: str, *, db_file: Path, lock: Any) -> str:
     with lock:
         with receipt_db_connection(db_file) as conn:
@@ -560,6 +590,7 @@ __all__ = [
     "query_order_payloads",
     "mark_order_payloads_fetched",
     "unmark_order_payloads",
+    "clear_orders_by_date",
     "cancel_latest_order_for_user",
     # receipt
     "raw_ref_belongs_to_user",
@@ -569,5 +600,6 @@ __all__ = [
     "insert_receipt_payload",
     "query_receipt_payloads_by_status",
     "update_receipt_payload_status",
+    "clear_receipts_by_date",
     "cancel_latest_receipt_for_user",
 ]

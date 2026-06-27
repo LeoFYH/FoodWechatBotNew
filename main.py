@@ -261,6 +261,14 @@ class ProductImportRequest(BaseModel):
     products: list[ProductImportItem] = Field(default_factory=list)
 
 
+class ClearOrdersByDateRequest(BaseModel):
+    order_date: str = Field(..., min_length=1)
+
+
+class ClearReceiptsByDateRequest(BaseModel):
+    date: str = Field(..., min_length=1)
+
+
 def load_memory() -> dict:
     if models.is_enabled():
         return models.load_memory()
@@ -418,6 +426,21 @@ def unmark_order_payloads(ids: list[int]) -> dict[str, list[int]]:
     return store_sqlite.unmark_order_payloads(ids, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
 
 
+def clear_orders_by_date(order_date: str) -> dict[str, Any]:
+    if models.is_enabled():
+        result = models.clear_orders_by_date(order_date)
+    else:
+        result = store_sqlite.clear_orders_by_date(order_date, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
+    # 不可逆强删，必须留痕：删了哪天 / 几条 / 哪些 id
+    logger.warning(
+        "orders_clear_by_date order_date=%s deleted=%s deleted_ids=%s",
+        order_date,
+        result.get("deleted"),
+        result.get("deleted_ids"),
+    )
+    return result
+
+
 def cancel_latest_order_for_user(user_id: str) -> str:
     if models.is_enabled():
         result = models.cancel_latest_order_for_user(user_id)
@@ -515,6 +538,21 @@ def query_receipt_payloads_by_status(date: str, status: str | None = None) -> li
         return models.query_receipt_payloads(date, status=status)
 
     return store_sqlite.query_receipt_payloads_by_status(date, status, db_file=RECEIPT_DB_FILE)
+
+
+def clear_receipts_by_date(date: str) -> dict[str, Any]:
+    if models.is_enabled():
+        result = models.clear_receipts_by_date(date)
+    else:
+        result = store_sqlite.clear_receipts_by_date(date, db_file=RECEIPT_DB_FILE, lock=RECEIPT_DB_LOCK)
+    # 不可逆强删，必须留痕：删了哪天 / 几条 / 哪些 id
+    logger.warning(
+        "receipts_clear_by_date date=%s deleted=%s deleted_ids=%s",
+        date,
+        result.get("deleted"),
+        result.get("deleted_ids"),
+    )
+    return result
 
 
 SESSION_MODE_CHAT = "chat"

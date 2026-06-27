@@ -21,10 +21,14 @@ from main import (
     RECEIPT_STATUS_NEW,
     ChatRequest,
     ChatResponse,
+    ClearOrdersByDateRequest,
+    ClearReceiptsByDateRequest,
     IdsRequest,
     MarkFetchedRequest,
     ProductImportRequest,
     TextOrderImportRequest,
+    clear_orders_by_date,
+    clear_receipts_by_date,
     handle_user_message,
     import_product_payloads,
     insert_order_payload,
@@ -87,6 +91,19 @@ def api_unmark_orders(request: Request, payload: MarkFetchedRequest) -> dict[str
     return unmark_order_payloads(payload.ids)
 
 
+@router.post("/api/orders/clear_by_date")
+def api_clear_orders_by_date(request: Request, payload: ClearOrdersByDateRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    order_date = validate_iso_date_param(payload.order_date, "order_date")
+    result = clear_orders_by_date(order_date)
+    return {
+        "ok": True,
+        "order_date": order_date,
+        "deleted": result["deleted"],
+        "deleted_ids": result["deleted_ids"],
+    }
+
+
 @router.get("/api/receipts")
 def api_receipts(
     request: Request,
@@ -110,6 +127,19 @@ def api_mark_receipts_fetched(request: Request, payload: IdsRequest) -> dict[str
 def api_unmark_receipts(request: Request, payload: IdsRequest) -> dict[str, Any]:
     require_robot_api_token(request)
     return unmark_receipt_payloads(payload.ids)
+
+
+@router.post("/api/receipts/clear_by_date")
+def api_clear_receipts_by_date(request: Request, payload: ClearReceiptsByDateRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    date = validate_iso_date_param(payload.date, "date")
+    result = clear_receipts_by_date(date)
+    return {
+        "ok": True,
+        "date": date,
+        "deleted": result["deleted"],
+        "deleted_ids": result["deleted_ids"],
+    }
 
 
 @router.post("/api/products/import")
