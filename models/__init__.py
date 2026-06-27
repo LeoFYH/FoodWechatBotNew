@@ -13,6 +13,7 @@ from . import production_receipts as pg_production_receipts
 from . import products as pg_products
 from . import redis_cache
 from .db import connection, database_url, default_tenant_code, is_enabled
+from .products import generate_product_code
 from .tenants import ensure_tenant
 
 logger = logging.getLogger("wechatclaw")
@@ -284,6 +285,31 @@ def upsert_product(
     return product_id
 
 
+def upsert_products(items: list[dict[str, Any]]) -> list[int]:
+    """批量 upsert：一条连接写完整批，批末失效一次缓存。返回各条 product_id（按入参顺序）。"""
+    _require_redis()
+    redis_cache.record_operation("products.import", {"count": len(items)})
+    ids: list[int] = []
+    with connection() as conn:
+        tenant_id = ensure_tenant(conn)
+        for item in items:
+            ids.append(
+                pg_products.upsert_product(
+                    conn,
+                    tenant_id,
+                    name=item.get("name", ""),
+                    spec=item.get("spec", ""),
+                    unit=item.get("unit", ""),
+                    category=item.get("category", ""),
+                    code=item.get("code", ""),
+                    metadata=item.get("metadata"),
+                )
+            )
+    if ids:
+        redis_cache.delete_pattern(_product_query_pattern())
+    return ids
+
+
 def list_active_products() -> list[dict[str, Any]]:
     _require_redis()
 
@@ -325,6 +351,7 @@ __all__ = [
     "database_url",
     "default_tenant_code",
     "find_product_candidates",
+    "generate_product_code",
     "insert_order_payload",
     "insert_receipt_payload",
     "is_enabled",
@@ -339,6 +366,7 @@ __all__ = [
     "query_receipt_payloads",
     "redis_url",
     "upsert_product",
+    "upsert_products",
     "save_kf_cursors",
     "save_memory",
     "save_session_state",

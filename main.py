@@ -49,6 +49,7 @@ import agent_router
 import models
 import store_sqlite  # 本地 SQLite 回退后端（双轨的 SQLite 这一轨；lock/db_file 由 main 注入）
 from order_normalize import *  # 订单归一化纯函数层（门面 re-export，调用点/测试可见性不变）
+from sku_normalize import *  # 入库 SKU 主数据归一化纯函数层（门面 re-export）
 from excel_import import *  # Excel 订单解析层（门面 re-export）
 from llm_json import *  # 大模型输出 JSON 提取通用 helper（门面 re-export）
 from vision_import import *  # 视觉/照片解析层（client/model 由 main 注入；门面 re-export）
@@ -247,6 +248,18 @@ class TextOrderImportRequest(BaseModel):
     raw_ref: str | None = None
 
 
+class ProductImportItem(BaseModel):
+    # name 不在模型层强制非空：空名要逐条回报错误（含 index），而非整批 422
+    name: str = ""
+    spec: str = ""
+    unit: str = ""
+    category: str = ""
+
+
+class ProductImportRequest(BaseModel):
+    products: list[ProductImportItem] = Field(default_factory=list)
+
+
 def load_memory() -> dict:
     if models.is_enabled():
         return models.load_memory()
@@ -328,6 +341,53 @@ def insert_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
         return models.insert_order_payload(normalized)
 
     return store_sqlite.insert_order_payload(normalized, db_file=ORDER_DB_FILE, lock=ORDER_DB_LOCK)
+
+
+PRODUCT_IMPORT_MAX_BATCH = 1000
+
+
+def import_product_payloads(products: list[dict[str, Any]]) -> dict[str, Any]:
+    """把一批 SKU 先归一化（只统一写法）再 upsert 进 products。幂等：归一后 name+spec 相同→同 code。"""
+    if len(products) > PRODUCT_IMPORT_MAX_BATCH:
+        raise HTTPException(status_code=400, detail=f"too many products (max {PRODUCT_IMPORT_MAX_BATCH})")
+    if not models.is_enabled():
+        raise HTTPException(status_code=503, detail="product import requires the PostgreSQL backend")
+
+    results: list[dict[str, Any] | None] = [None] * len(products)
+    valid: list[tuple[int, dict[str, str], str]] = []
+    for index, raw in enumerate(products):
+        normalized = normalize_sku(
+            name=raw.get("name"),
+            spec=raw.get("spec"),
+            unit=raw.get("unit"),
+            category=raw.get("category"),
+        )
+        if not normalized["name"]:
+            results[index] = {"index": index, "status": "error", "error": "name is required"}
+            continue
+        code = models.generate_product_code(normalized["name"], normalized["spec"])
+        valid.append((index, normalized, code))
+
+    merged_in_batch = len(valid) - len({code for _, _, code in valid})
+
+    if valid:
+        ids = models.upsert_products([normalized for _, normalized, _ in valid])
+        for (index, normalized, code), product_id in zip(valid, ids):
+            results[index] = {
+                "index": index,
+                "status": "ok",
+                "product_id": product_id,
+                "code": code,
+                "normalized": normalized,
+            }
+
+    return {
+        "total": len(products),
+        "succeeded": sum(1 for r in results if r and r["status"] == "ok"),
+        "failed": sum(1 for r in results if r and r["status"] == "error"),
+        "merged_in_batch": merged_in_batch,
+        "results": results,
+    }
 
 
 def query_order_payloads(

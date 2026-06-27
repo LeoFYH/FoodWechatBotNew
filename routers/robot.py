@@ -23,8 +23,10 @@ from main import (
     ChatResponse,
     IdsRequest,
     MarkFetchedRequest,
+    ProductImportRequest,
     TextOrderImportRequest,
     handle_user_message,
+    import_product_payloads,
     insert_order_payload,
     llm_order_draft_from_message,
     llm_parse_photo_order,
@@ -108,6 +110,12 @@ def api_mark_receipts_fetched(request: Request, payload: IdsRequest) -> dict[str
 def api_unmark_receipts(request: Request, payload: IdsRequest) -> dict[str, Any]:
     require_robot_api_token(request)
     return unmark_receipt_payloads(payload.ids)
+
+
+@router.post("/api/products/import")
+def api_import_products(request: Request, payload: ProductImportRequest) -> dict[str, Any]:
+    require_robot_api_token(request)
+    return import_product_payloads([item.model_dump() for item in payload.products])
 
 
 @router.post("/api/orders/import/excel")
