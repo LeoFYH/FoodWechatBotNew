@@ -881,6 +881,9 @@ def handle_receipt_user_message(user_id: str, message: str) -> ChatResponse:
         history_length=0,
     )
 
+CALIBRATE_MIN_SCORE = 0.7  # 粗筛门槛：低于此相似度的候选根本不进 LLM（与品名硬闸 ACCEPT_SCORE 同档）
+
+
 def calibrate_receipt_draft(draft: dict[str, Any]) -> dict[str, Any]:
     """照片识别后、存草稿前的 SKU 校准。只在 PG 启用时跑；任何异常都兜底为不校准。
 
@@ -894,7 +897,8 @@ def calibrate_receipt_draft(draft: dict[str, Any]) -> dict[str, Any]:
 
     def _find(name: str) -> list[dict[str, Any]]:
         try:
-            return models.find_product_candidates(name, top_n=5, min_score=0.3)
+            # 门槛从严：相似度不够高的根本不进候选，砍掉噪音也省 token
+            return models.find_product_candidates(name, top_n=5, min_score=CALIBRATE_MIN_SCORE)
         except Exception as exc:
             logger.warning("sku_calibrate_find_failed name=%s error=%s", name, exc)
             return []
@@ -910,8 +914,13 @@ def calibrate_receipt_draft(draft: dict[str, Any]) -> dict[str, Any]:
         )
         return extract_json_object(response.choices[0].message.content or "")
 
+    def _debug(message: str) -> None:
+        logger.info("sku_calibrate %s", message)
+
     try:
-        draft["items"] = calibrate_receipt_items(items, find_candidates=_find, judge=_judge)
+        draft["items"] = calibrate_receipt_items(
+            items, find_candidates=_find, judge=_judge, debug=_debug
+        )
     except Exception as exc:
         logger.warning("sku_calibrate_failed error=%s", exc)  # 整体异常 → 不校准，保留原识别
     return draft

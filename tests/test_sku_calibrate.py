@@ -8,9 +8,9 @@ from sku_calibrate import (
 )
 
 
-# 候选结构与 models.find_product_candidates 返回一致：有 code/name/spec，绝无 qty
-CAND_HUNTUN = {"product_id": 1, "code": "sku_huntun", "name": "鲜肉大馄饨", "spec": "340g*24"}
-CAND_ZHENGJIAO = {"product_id": 2, "code": "sku_zhengjiao", "name": "韭菜鸡蛋蒸饺", "spec": "500g"}
+# 候选结构与 models.find_product_candidates 返回一致：有 code/name/spec/score，绝无 qty
+CAND_HUNTUN = {"product_id": 1, "code": "sku_huntun", "name": "鲜肉大馄饨", "spec": "340g*24", "score": 1.0}
+CAND_ZHENGJIAO = {"product_id": 2, "code": "sku_zhengjiao", "name": "韭菜鸡蛋蒸饺", "spec": "500g", "score": 0.8}
 
 
 def photo_item(name, qty, unit, spec=None):
@@ -108,6 +108,48 @@ class UnmatchedKeptNotDropped(unittest.TestCase):
         self.assertIsNone(out[1]["code"])          # ⚠行仍写库，只是未标准化
         self.assertEqual(out[1]["name"], "车间自制小料")
         self.assertEqual(out[1]["qty"], 3)
+
+
+class NameGateTests(unittest.TestCase):
+    """品名硬闸：LLM 选定且 code 在候选内，但标准名与识别名相似度 < 0.7 → 推翻判未匹配。"""
+
+    def test_disaster_blocked(self):
+        # 模拟"侧门混入"：脏候选(油焖鸡)靠某种途径进了鸭蛋面的候选池(score 被抬高)，
+        # 且 LLM 选了它、code 也在池内(过了二次设闸)——品名硬闸必须拦下。
+        dirty = {"product_id": 9, "code": "sku_youmenji", "name": "黄豆油焖鸡", "spec": "1kg", "score": 0.9}
+        items = [photo_item("冷冻熟鸭蛋面", 20, "箱")]
+        out = apply_calibration(items, {0: [dirty]}, {0: "sku_youmenji"})
+        self.assertIsNone(out[0]["code"])              # 被品名硬闸推翻
+        self.assertEqual(out[0]["name"], "冷冻熟鸭蛋面")  # 保留原识别
+        self.assertEqual(out[0]["qty"], 20)
+
+    def test_close_name_passes_gate(self):
+        # 字典里真有对应(冷冻熟制鸡蛋面那种)——高相似度，应 ✅
+        cand = {"product_id": 3, "code": "sku_jdm", "name": "冷冻熟鸭蛋面", "spec": "2kg", "score": 1.0}
+        items = [photo_item("冷冻熟鸭蛋面", 20, "箱")]
+        out = apply_calibration(items, {0: [cand]}, {0: "sku_jdm"})
+        self.assertEqual(out[0]["code"], "sku_jdm")    # 真对应，✅
+        self.assertEqual(out[0]["spec"], "2kg")
+
+    def test_borderline_below_floor_blocked(self):
+        # 部分词重叠但标准名差异较大 → 即使 LLM 选了也推翻
+        cand = {"product_id": 4, "code": "sku_x", "name": "熟鸭蛋", "spec": "", "score": 0.9}
+        items = [photo_item("冷冻熟鸭蛋面", 20, "箱")]  # vs 熟鸭蛋 ≈ 0.667 < 0.7
+        out = apply_calibration(items, {0: [cand]}, {0: "sku_x"})
+        self.assertIsNone(out[0]["code"])
+        self.assertEqual(out[0]["name"], "冷冻熟鸭蛋面")
+
+
+class DebugCallbackTests(unittest.TestCase):
+    def test_debug_emits_per_line_with_reason(self):
+        logs: list[str] = []
+        dirty = {"product_id": 9, "code": "sku_youmenji", "name": "黄豆油焖鸡", "spec": "1kg", "score": 0.9}
+        items = [photo_item("冷冻熟鸭蛋面", 20, "箱")]
+        apply_calibration(items, {0: [dirty]}, {0: "sku_youmenji"}, debug=logs.append)
+        self.assertEqual(len(logs), 1)
+        self.assertIn("冷冻熟鸭蛋面", logs[0])    # 识别名
+        self.assertIn("黄豆油焖鸡:0.9", logs[0])  # 候选名:分
+        self.assertIn("品名硬闸推翻", logs[0])     # 原因
 
 
 class NormalizeMatchesTests(unittest.TestCase):
