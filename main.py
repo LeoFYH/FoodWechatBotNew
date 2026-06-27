@@ -697,6 +697,23 @@ def save_session_record(user_id: str, record: dict[str, Any]) -> None:
         save_session_state(state)
 
 
+# 撤销二次确认的"待撤"会话态："order"/"receipt"/""。撤销三道闸用：AI 判要撤 → set；用户回"是" → 真撤后 clear。
+def get_pending_revoke(user_id: str) -> str:
+    return str(get_session_record(user_id).get("pending_revoke") or "")
+
+
+def set_pending_revoke(user_id: str, target: str) -> None:
+    record = get_session_record(user_id)
+    record["pending_revoke"] = target
+    save_session_record(user_id, record)
+
+
+def clear_pending_revoke(user_id: str) -> None:
+    record = get_session_record(user_id)
+    if record.pop("pending_revoke", None) is not None:
+        save_session_record(user_id, record)
+
+
 def get_session_mode(user_id: str) -> str:
     mode = str(get_session_record(user_id).get("mode") or SESSION_MODE_CHAT)
     if mode not in SESSION_MODES:

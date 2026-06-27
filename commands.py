@@ -122,6 +122,14 @@ def is_receipt_revoke_target(command: str) -> bool:
     return command_contains_any(command, {"入库", "入库记录", "成品", "产成品"})
 
 
+# 撤销二次确认的"是"——确定性紧词表，绝不含"好吧"等勉强语气；用户回这些才真撤（代码扣扳机）。
+REVOKE_CONFIRM_COMMANDS = {"是", "是的", "对", "对的", "确认", "确认撤回", "确定", "嗯", "yes", "y", "ok"}
+
+
+def is_revoke_confirm(command: str) -> bool:
+    return command in REVOKE_CONFIRM_COMMANDS
+
+
 def is_status_command(command: str) -> bool:
     if command in STATUS_COMMANDS:
         return True
@@ -218,6 +226,8 @@ __all__ = [
     "is_exit_mode_command",
     "is_revoke_command",
     "is_receipt_revoke_target",
+    "REVOKE_CONFIRM_COMMANDS",
+    "is_revoke_confirm",
     "is_status_command",
     "is_business_query_or_negated",
     "is_order_mode_command",

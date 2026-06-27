@@ -74,7 +74,7 @@ REJECT_KEYWORDS = {
     "稍等",
     "等会",
 }
-DRAFT_AMBIGUOUS_NO_ACTION = {"没事", "没事了", "没事儿", "没事啦"}
+DRAFT_AMBIGUOUS_NO_ACTION = {"没事", "没事了", "没事儿", "没事啦", "好吧", "行吧", "也行吧", "那好吧"}
 MODIFY_KEYWORDS = {
     "加",
     "再加",

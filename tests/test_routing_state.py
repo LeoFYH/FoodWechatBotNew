@@ -303,6 +303,77 @@ class RoutingStateTests(unittest.TestCase):
         self.assertIn("那单还在", response.answer)  # 草稿提醒
         self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
 
+    # ---- 危险动作语境修复：撤销三道闸 / "好吧"不算确认 / 提示语补取消出口 ----
+
+    def test_reluctant_haoba_is_not_confirm_keeps_draft(self) -> None:
+        # "好吧"勉强语气 → 不再被判成确认写库；走闲聊+提醒，草稿仍在。
+        self.main.save_order_draft("u1", dict(self._ORDER_DRAFT_FIXTURE))
+        with patch.object(self.dispatch, "call_customer_chat_llm", return_value="嗯好。"):
+            response = self.main.handle_user_message("u1", "好吧")
+        self.assertNotIn("已保存订单入库", response.answer)  # 没确认写库
+        self.assertIn("那单还在", response.answer)  # 闲聊+草稿提醒
+        self.assertTrue(self.main.order_draft_has_content(self.main.get_order_draft("u1")))  # 草稿仍在
+
+    def test_revoke_negation_or_question_does_not_revoke(self) -> None:
+        # "别撤销""我可以撤销吗" → AI 判"不是" → 不触发撤销、不设 pending。
+        with patch.object(self.dispatch, "revoke_intent_is_real", return_value=False), patch.object(
+            self.dispatch, "call_customer_chat_llm", return_value="嗯好。"
+        ):
+            r1 = self.main.handle_user_message("u1", "别撤销")
+            r2 = self.main.handle_user_message("u1", "我可以撤销吗")
+        self.assertNotIn("确认撤回", r1.answer)
+        self.assertNotIn("确认撤回", r2.answer)
+        self.assertEqual(self.main.get_pending_revoke("u1"), "")  # 没进二次确认
+
+    def test_revoke_three_gates_confirm_then_yes(self) -> None:
+        # 三道闸：AI 判要撤 → 二次确认(带数据，未撤) → 用户"是" → 才真撤。
+        self.main.insert_order_payload(
+            {
+                "kind": "base",
+                "source": "excel",
+                "store": "鼓楼店",
+                "items": [{"name": "鲜肉馄饨", "qty": 20, "unit": "箱"}],
+                "confirmed": True,
+                "raw_ref": "u1",
+            }
+        )
+        self.assertEqual(len(self.main.query_order_payloads()), 1)
+
+        with patch.object(self.dispatch, "revoke_intent_is_real", return_value=True):
+            confirm = self.main.handle_user_message("u1", "撤销上一单")
+        self.assertIn("确认撤回", confirm.answer)  # 二次确认
+        self.assertIn("鼓楼店", confirm.answer)  # 逐字带数据
+        self.assertEqual(self.main.get_pending_revoke("u1"), "order")  # pending 已设
+        self.assertEqual(len(self.main.query_order_payloads()), 1)  # 此刻还没撤
+
+        response = self.main.handle_user_message("u1", "是")  # 第三道：代码识别"是"才撤
+        self.assertIn("撤回了", response.answer)
+        self.assertEqual(self.main.get_pending_revoke("u1"), "")  # pending 清
+        self.assertEqual(len(self.main.query_order_payloads()), 0)  # 已撤
+
+    def test_revoke_pending_non_yes_does_not_revoke(self) -> None:
+        # pending 已设但用户回的不是"是" → 撤销作罢、清 pending、订单仍在。
+        self.main.insert_order_payload(
+            {
+                "kind": "base",
+                "source": "excel",
+                "store": "鼓楼店",
+                "items": [{"name": "鲜肉馄饨", "qty": 20, "unit": "箱"}],
+                "confirmed": True,
+                "raw_ref": "u1",
+            }
+        )
+        self.main.set_pending_revoke("u1", "order")
+        with patch.object(self.dispatch, "call_customer_chat_llm", return_value="嗯好。"):
+            response = self.main.handle_user_message("u1", "算了不撤了")
+        self.assertNotIn("撤回了", response.answer)
+        self.assertEqual(self.main.get_pending_revoke("u1"), "")  # pending 清
+        self.assertEqual(len(self.main.query_order_payloads()), 1)  # 订单仍在
+
+    def test_draft_confirm_hint_mentions_cancel_exit(self) -> None:
+        self.assertIn("取消", self.dispatch.CONFIRM_HINT_MODIFY)
+        self.assertIn("取消", self.dispatch.CONFIRM_HINT_CONTINUE_MODIFY)
+
     def test_order_draft_view_command_shows_current_draft_without_llm(self) -> None:
         self.main.save_order_draft(
             "u1",
