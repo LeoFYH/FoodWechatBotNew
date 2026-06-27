@@ -10,8 +10,10 @@ from . import channel_cursors as pg_channel_cursors
 from . import conversations as pg_conversations
 from . import orders as pg_orders
 from . import production_receipts as pg_production_receipts
+from . import products as pg_products
 from . import redis_cache
-from .db import database_url, default_tenant_code, is_enabled
+from .db import connection, database_url, default_tenant_code, is_enabled
+from .tenants import ensure_tenant
 
 logger = logging.getLogger("wechatclaw")
 
@@ -69,6 +71,28 @@ def _receipt_query_key(receipt_date: str, status: str | None) -> str:
 
 def _receipt_query_pattern() -> str:
     return redis_cache.make_key("receipts", "query", "*")
+
+
+def _product_list_key() -> str:
+    return redis_cache.make_key("products", "active")
+
+
+def _product_candidates_key(query_name: str, top_n: int, min_score: float) -> str:
+    return redis_cache.make_key(
+        "products",
+        "candidates",
+        redis_cache.hash_args(
+            {
+                "min_score": min_score,
+                "query": query_name,
+                "top_n": top_n,
+            }
+        ),
+    )
+
+
+def _product_query_pattern() -> str:
+    return redis_cache.make_key("products", "*")
 
 
 def load_memory() -> dict:
@@ -220,15 +244,92 @@ def save_kf_cursors(cursors: dict[str, str]) -> None:
     redis_cache.set_json(_state_key("kf_cursors"), cursors)
 
 
+def upsert_product(
+    *,
+    name: str,
+    spec: str = "",
+    unit: str = "",
+    category: str = "",
+    status: str = "active",
+    code: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    _require_redis()
+    redis_cache.record_operation(
+        "products.upsert",
+        {
+            "category": category,
+            "code": code,
+            "metadata": metadata or {},
+            "name": name,
+            "spec": spec,
+            "status": status,
+            "unit": unit,
+        },
+    )
+    with connection() as conn:
+        tenant_id = ensure_tenant(conn)
+        product_id = pg_products.upsert_product(
+            conn,
+            tenant_id,
+            name=name,
+            spec=spec,
+            unit=unit,
+            category=category,
+            status=status,
+            code=code,
+            metadata=metadata,
+        )
+    redis_cache.delete_pattern(_product_query_pattern())
+    return product_id
+
+
+def list_active_products() -> list[dict[str, Any]]:
+    _require_redis()
+
+    def loader() -> list[dict[str, Any]]:
+        with connection() as conn:
+            tenant_id = ensure_tenant(conn)
+            return pg_products.list_active_products(conn, tenant_id)
+
+    return redis_cache.load_or_set(_product_list_key(), loader)
+
+
+def find_product_candidates(
+    query_name: str,
+    top_n: int = 5,
+    min_score: float = 0.0,
+) -> list[dict[str, Any]]:
+    _require_redis()
+
+    def loader() -> list[dict[str, Any]]:
+        with connection() as conn:
+            tenant_id = ensure_tenant(conn)
+            return pg_products.find_product_candidates(
+                conn,
+                tenant_id,
+                query_name,
+                top_n=top_n,
+                min_score=min_score,
+            )
+
+    return redis_cache.load_or_set(
+        _product_candidates_key(query_name, top_n, min_score),
+        loader,
+    )
+
+
 __all__ = [
     "cancel_latest_order_for_user",
     "cancel_latest_receipt_for_user",
     "database_url",
     "default_tenant_code",
+    "find_product_candidates",
     "insert_order_payload",
     "insert_receipt_payload",
     "is_enabled",
     "is_redis_cache_enabled",
+    "list_active_products",
     "load_kf_cursors",
     "load_memory",
     "load_session_state",
@@ -237,6 +338,7 @@ __all__ = [
     "query_order_payloads",
     "query_receipt_payloads",
     "redis_url",
+    "upsert_product",
     "save_kf_cursors",
     "save_memory",
     "save_session_state",
