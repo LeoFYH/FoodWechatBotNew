@@ -55,7 +55,9 @@ from main import (
     MODEL_NAME,
     ORDER_CANCEL_COMMANDS,
     ORDER_EXPORT_COMMANDS,
+    ORDER_KIND_BASE,
     ORDER_KIND_PATCH,
+    ORDER_SOURCE_TEXT,
     ORDER_SKILL_FILE,
     ORDER_STATUS_NEW,
     PROMPT_TURN_CONTEXT,
@@ -429,10 +431,12 @@ def llm_order_draft_from_message(existing_draft: dict[str, Any], message: str) -
             if existing_draft.get(key):
                 parsed[key] = existing_draft.get(key)
 
-    explicit_order_date = extract_explicit_order_date(message)
-    if explicit_order_date:
-        parsed["order_date"] = explicit_order_date
+    if not existing_draft:
+        # 文字加单独立成 base 订单，不再依附 excel 做 patch（修改既有草稿则沿用其身份字段，见上）
+        parsed["kind"] = ORDER_KIND_BASE
+        parsed["source"] = ORDER_SOURCE_TEXT
 
+    # order_date 由四点线在 save_order_draft 统一盖（覆盖文字里写的日期），这里不再按显式日期定。
     parsed["confirmed"] = False
     parsed["status"] = ORDER_STATUS_NEW
     parsed["created_at"] = parsed.get("created_at") or now_iso()

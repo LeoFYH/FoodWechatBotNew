@@ -856,6 +856,8 @@ def get_order_draft(user_id: str) -> dict[str, Any]:
 def save_order_draft(user_id: str, draft: dict[str, Any]) -> None:
     record = get_session_record(user_id)
     record["mode"] = SESSION_MODE_ORDER
+    # 四点线：order_date 一律按提交时刻（北京时间）定，覆盖来源日期。就地写回，调用方回显同步可见。
+    draft["order_date"] = business_order_date()
     record["order_draft"] = normalize_order_draft(draft)
     record.pop("receipt_draft", None)
     record.pop("pending_confirm", None)  # 草稿新建/被修改 → 重置确认闸，杜绝旧待确认态写新草稿

@@ -14,8 +14,39 @@ import json
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from openpyxl.utils.datetime import from_excel
+
+
+# 订单截止线：北京时间每天 16:00。之后下的单算到次日（入库晚一天）。
+ORDER_CUTOFF_HOUR = 16
+_ORDER_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _now_bjt(now: datetime | None) -> datetime:
+    return now if now is not None else datetime.now(_ORDER_TZ)
+
+
+def business_order_date(now: datetime | None = None) -> str:
+    """按提交时刻（北京时间）定订单归属日：16:00 前 = 今天，16:00 及以后 = 今天+1。
+
+    强制覆盖来源日期（excel 表头 / 照片 / 文字里写的日期都不再决定 order_date）。
+    now 可注入以便测试。
+    """
+    current = _now_bjt(now)
+    base = current.date()
+    if current.hour >= ORDER_CUTOFF_HOUR:
+        base = base + timedelta(days=1)
+    return base.isoformat()
+
+
+def order_cutoff_hint(order_date: str, now: datetime | None = None) -> str:
+    """order_date 晚于今天（即被 4 点线顺延）时，返回给用户的逐字提示；否则空串。"""
+    today = _now_bjt(now).date().isoformat()
+    if order_date and order_date > today:
+        return f"⏰ 已过下午4点，这单按 明天（{order_date}） 入库，晚一天。"
+    return ""
 
 
 ORDER_KIND_BASE = "base"
@@ -435,6 +466,10 @@ def format_order_draft_summary(draft: dict[str, Any]) -> str:
                 parts.append(str(item.get("category")))
             lines.append(f"{index}. {' / '.join(part for part in parts if part)}")
 
+    hint = order_cutoff_hint(draft.get("order_date") or "")
+    if hint:
+        lines.append(hint)
+
     return "\n".join(lines)
 
 
@@ -460,6 +495,9 @@ __all__ = [
     # 共享纯原语
     "now_iso",
     "clean_export_value",
+    "ORDER_CUTOFF_HOUR",
+    "business_order_date",
+    "order_cutoff_hint",
     # 归一化/格式化函数
     "clean_order_value",
     "optional_text",
