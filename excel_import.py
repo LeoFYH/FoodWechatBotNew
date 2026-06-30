@@ -50,7 +50,8 @@ EXCEL_HEADER_ALIASES = {
     "spec": {"规格", "规格型号", "型号", "包装规格", "spec"},
     "unit": {"单位", "unit"},
     "qty": {"数量", "订货数量", "订购数量", "下单数量", "箱数", "件数", "qty"},
-    "price": {"单价", "价格", "price"},
+    "price": {"单价", "价格", "含税单价", "不含税单价", "price"},
+    "amount": {"金额", "总金额", "金额合计", "小计", "amount", "total_amount"},
     "category": {"分类", "类别", "品类", "category"},
 }
 
@@ -91,6 +92,15 @@ def excel_header_key(value: Any) -> str | None:
         return "qty"
     if normalized.endswith("数量") and not normalized.endswith("订单数量"):
         return "qty"
+    # 规格：商品规格 / 产品规格 / 规格型号（“商品名称规格…”已在上面的 name 规则先行命中）
+    if "规格" in normalized:
+        return "spec"
+    # 金额必须先于单价判：避免“含税单价”这类被泛化；金额一律进 amount，绝不进 price
+    if "金额" in normalized:
+        return "amount"
+    # 单价 / 含税单价（元）/ 价格 → price（不含“金额”，上一行已拦截）
+    if "单价" in normalized or "价格" in normalized:
+        return "price"
     return None
 
 
@@ -269,8 +279,8 @@ def score_excel_header_candidate(rows: list[tuple[Any, ...]], header_index: int)
     if not data_rows:
         return 0, {}, 0
 
-    bad_name_keys = {"store", "order_no", "orderer", "order_date", "deliver_date", "code", "unit", "qty", "price", "category"}
-    bad_qty_keys = {"store", "order_no", "orderer", "order_date", "deliver_date", "code", "name", "spec", "unit", "price", "category"}
+    bad_name_keys = {"store", "order_no", "orderer", "order_date", "deliver_date", "code", "unit", "qty", "price", "amount", "category"}
+    bad_qty_keys = {"store", "order_no", "orderer", "order_date", "deliver_date", "code", "name", "spec", "unit", "price", "amount", "category"}
     columns = list(excel_candidate_columns(header_row, data_rows))
     best_score = 0
     best_map: dict[int, str] = {}
@@ -579,6 +589,7 @@ def parse_excel_order_payloads(file_bytes: bytes, raw_ref: str) -> list[dict[str
                 "unit": row_value_by_header(row, header_map, "unit") or header_units.get("qty"),
                 "qty": row_value_by_header(row, header_map, "qty"),
                 "price": row_value_by_header(row, header_map, "price"),
+                "amount": row_value_by_header(row, header_map, "amount"),
                 "category": row_value_by_header(row, header_map, "category"),
             }
             normalized_item = normalize_base_item(item)

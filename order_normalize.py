@@ -298,6 +298,7 @@ def normalize_base_item(item: dict[str, Any]) -> dict[str, Any]:
         "unit": optional_text(item.get("unit")),
         "qty": normalize_number(item.get("qty")),
         "price": normalize_number(item.get("price")),
+        "amount": normalize_number(item.get("amount")),
         "category": optional_text(item.get("category")),
     }
     return normalized
